@@ -178,8 +178,7 @@ static pid_t get_parent_pid(pid_t pid) {
 }
 
 // Function to get WRAPPER value from process environment variables
-static char* get_wrapper_from_env_process(pid_t pid) {
-    static char wrapper_value[256];
+static bool get_wrapper_from_env_process(pid_t pid, char* result_buffer, size_t buffer_size) {
 
     // Get the full process args and environment data
     int mib[3] = { CTL_KERN, KERN_PROCARGS2, pid };
@@ -187,32 +186,32 @@ static char* get_wrapper_from_env_process(pid_t pid) {
 
     if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0) {
         fprintf(stderr, "    sysctl size query failed for PID %d (errno=%d)\n", pid, errno);
-        return NULL;
+        return false;
     }
 
     // Sanity check the size
     if (size < sizeof(int) || size > 1024 * 1024) { // Max 1MB seems reasonable
         fprintf(stderr, "    suspicious size %zu for PID %d, aborting\n", size, pid);
-        return NULL;
+        return false;
     }
 
     char *proc_data = malloc(size);
     if (!proc_data) {
         fprintf(stderr, "    malloc failed for PID %d\n", pid);
-        return NULL;
+        return false;
     }
 
     if (sysctl(mib, 3, proc_data, &size, NULL, 0) != 0) {
         fprintf(stderr, "    sysctl data query failed for PID %d (errno=%d)\n", pid, errno);
         free(proc_data);
-        return NULL;
+        return false;
     }
 
     // Bounds checking - ensure we have at least space for argc
     if (size < sizeof(int)) {
         fprintf(stderr, "    insufficient data for PID %d (size=%zu)\n", pid, size);
         free(proc_data);
-        return NULL;
+        return false;
     }
 
     // Format: argc, then executable path, then args, then env
@@ -224,7 +223,7 @@ static char* get_wrapper_from_env_process(pid_t pid) {
     if (argc < 0 || argc > 1000) { // Reasonable limit
         fprintf(stderr, "    suspicious argc %d for PID %d, aborting\n", argc, pid);
         free(proc_data);
-        return NULL;
+        return false;
     }
 
     fprintf(stderr, "    PID %d has %d args, checking environment...\n", pid, argc);
@@ -233,14 +232,14 @@ static char* get_wrapper_from_env_process(pid_t pid) {
     if (ptr >= data_end) {
         fprintf(stderr, "    no space for executable path in PID %d\n", pid);
         free(proc_data);
-        return NULL;
+        return false;
     }
 
     size_t exec_len = strnlen(ptr, data_end - ptr);
     if (exec_len == (size_t)(data_end - ptr)) {
         fprintf(stderr, "    unterminated executable path in PID %d\n", pid);
         free(proc_data);
-        return NULL;
+        return false;
     }
     ptr += exec_len + 1;
 
@@ -256,7 +255,7 @@ static char* get_wrapper_from_env_process(pid_t pid) {
             if (arg_len == (size_t)(data_end - ptr)) {
                 fprintf(stderr, "    unterminated arg[%d] in PID %d\n", i, pid);
                 free(proc_data);
-                return NULL;
+                return false;
             }
             fprintf(stderr, "    arg[%d]: %.*s\n", i, (int)arg_len, ptr);
             ptr += arg_len + 1;
@@ -279,21 +278,21 @@ static char* get_wrapper_from_env_process(pid_t pid) {
         if (env_len >= 8 && strncmp(ptr, "WRAPPER=", 8) == 0) {
             // Found WRAPPER= environment variable, extract the value
             size_t value_len = env_len - 8;
-            if (value_len >= sizeof(wrapper_value)) {
-                value_len = sizeof(wrapper_value) - 1;
+            if (value_len >= buffer_size) {
+                value_len = buffer_size - 1;
             }
-            strncpy(wrapper_value, ptr + 8, value_len);
-            wrapper_value[value_len] = '\0';
-            fprintf(stderr, "    Found WRAPPER=%s (env var #%d)\n", wrapper_value, env_count);
+            strncpy(result_buffer, ptr + 8, value_len);
+            result_buffer[value_len] = '\0';
+            fprintf(stderr, "    Found WRAPPER=%s (env var #%d)\n", result_buffer, env_count);
             free(proc_data);
-            return wrapper_value;
+            return true;
         }
         ptr += env_len + 1;
     }
 
     fprintf(stderr, "    Checked %d environment variables, no WRAPPER found\n", env_count);
     free(proc_data);
-    return NULL;
+    return false;
 }
 
 // Function to build redirected path based on wrapper value
@@ -372,10 +371,11 @@ static struct wrapper_info find_wrapper_in_tree(pid_t starting_pid) {
         }
 
         // Check if this process has WRAPPER in its environment variables
-        char *wrapper_value = get_wrapper_from_env_process(current_pid);
+        char wrapper_value[256];
+        bool found_wrapper = get_wrapper_from_env_process(current_pid, wrapper_value, sizeof(wrapper_value));
         int has_wrapper = 0;
 
-        if (wrapper_value) {
+        if (found_wrapper) {
             has_wrapper = 1;
             fprintf(stderr, "  Found WRAPPER=%s in %s process environment!\n", wrapper_value, basename);
         } else {
@@ -390,7 +390,7 @@ static struct wrapper_info find_wrapper_in_tree(pid_t starting_pid) {
         if (has_wrapper) {
             result.found = 1;
             result.pid = current_pid;
-            if (wrapper_value) {
+            if (found_wrapper) {
                 strncpy(result.value, wrapper_value, sizeof(result.value) - 1);
                 result.value[sizeof(result.value) - 1] = '\0';
                 fprintf(stderr, "Found WRAPPER=%s at PID %d!\n", wrapper_value, current_pid);
