@@ -39,6 +39,8 @@
 #include <sys/vnode.h>
 #include <sys/xattr.h>
 #include <unistd.h>
+#include <libproc.h>
+#include <sys/sysctl.h>
 
 #if defined(_POSIX_C_SOURCE)
 typedef unsigned char  u_char;
@@ -50,14 +52,414 @@ typedef unsigned long  u_long;
 struct loopback {
     uint32_t blocksize;
     bool case_insensitive;
+    char mount_point[PATH_MAX];        // Store the mount point path
+    size_t mount_point_len;            // Length of mount point path
+    char backup_path[PATH_MAX];        // Backup location (mount_point + ".fuse")
+    bool backup_created;               // Whether we created the backup
 };
 
 static struct loopback loopback;
+
+// Function to move all contents from src_dir to dst_dir
+static int move_directory_contents(const char *src_dir, const char *dst_dir) {
+    DIR *dir = opendir(src_dir);
+    if (!dir) {
+        fprintf(stderr, "Failed to open source directory %s: %s\n", src_dir, strerror(errno));
+        return -1;
+    }
+
+    struct dirent *entry;
+    int failed = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        // Skip . and ..
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        char src_path[PATH_MAX], dst_path[PATH_MAX];
+        snprintf(src_path, sizeof(src_path), "%s/%s", src_dir, entry->d_name);
+        snprintf(dst_path, sizeof(dst_path), "%s/%s", dst_dir, entry->d_name);
+
+        if (rename(src_path, dst_path) != 0) {
+            fprintf(stderr, "Failed to move %s to %s: %s\n", src_path, dst_path, strerror(errno));
+            failed = 1;
+            // Continue trying to move other files
+        }
+    }
+
+    closedir(dir);
+    return failed ? -1 : 0;
+}
+
+// Function to create backup of mount point
+static int create_mount_point_backup(void) {
+    if (loopback.mount_point_len == 0) {
+        return 0; // No mount point to backup
+    }
+
+    // For macOS: assume /foo maps to /System/Volumes/Data/foo
+    char real_mount_path[PATH_MAX];
+    char real_backup_path[PATH_MAX];
+
+    snprintf(real_mount_path, sizeof(real_mount_path), "/System/Volumes/Data%s", loopback.mount_point);
+    snprintf(real_backup_path, sizeof(real_backup_path), "/System/Volumes/Data%s.fuse", loopback.mount_point);
+    snprintf(loopback.backup_path, sizeof(loopback.backup_path), "%s", real_backup_path);
+
+    // Check if backup already exists from previous run
+    struct stat backup_st;
+    if (stat(real_backup_path, &backup_st) == 0) {
+        fprintf(stderr, "Using existing backup: %s\n", real_backup_path);
+        loopback.backup_created = true;
+        return 0;
+    }
+
+    // Check if mount point exists to backup
+    struct stat mount_st;
+    if (stat(real_mount_path, &mount_st) != 0) {
+        fprintf(stderr, "Mount point %s does not exist, no backup needed\n", real_mount_path);
+        return 0;
+    }
+
+    // Create backup directory
+    if (mkdir(real_backup_path, 0755) != 0) {
+        fprintf(stderr, "Failed to create backup directory %s: %s\n", real_backup_path, strerror(errno));
+        return -1;
+    }
+
+    // Move contents from mount_point to backup_path
+    if (move_directory_contents(real_mount_path, real_backup_path) == 0) {
+        fprintf(stderr, "Created backup by moving contents: %s/* -> %s/\n", real_mount_path, real_backup_path);
+        loopback.backup_created = true;
+        return 0;
+    } else {
+        fprintf(stderr, "Failed to move contents for backup\n");
+        rmdir(real_backup_path); // Clean up empty backup directory
+        return -1;
+    }
+}
+
+// Function to restore mount point from backup
+static void restore_mount_point_backup(void) {
+    if (!loopback.backup_created) {
+        return; // No backup to restore
+    }
+
+    // For macOS: construct real paths
+    char real_mount_path[PATH_MAX];
+    snprintf(real_mount_path, sizeof(real_mount_path), "/System/Volumes/Data%s", loopback.mount_point);
+
+    // Remove the empty mount point directory left by FUSE (if it exists)
+    rmdir(loopback.mount_point);
+
+    // Move contents back from backup to mount point
+    if (move_directory_contents(loopback.backup_path, real_mount_path) == 0) {
+        fprintf(stderr, "Restored backup by moving contents: %s/* -> %s/\n", loopback.backup_path, real_mount_path);
+
+        // Remove the now-empty backup directory
+        if (rmdir(loopback.backup_path) == 0) {
+            fprintf(stderr, "Removed backup directory: %s\n", loopback.backup_path);
+        } else {
+            fprintf(stderr, "Warning: Failed to remove backup directory: %s\n", loopback.backup_path);
+        }
+    } else {
+        fprintf(stderr, "Failed to restore backup contents\n");
+    }
+    loopback.backup_created = false;
+}
+
+// Function to get parent PID of a given PID
+static pid_t get_parent_pid(pid_t pid) {
+    struct proc_bsdinfo proc_info;
+    if (proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &proc_info, sizeof(proc_info)) <= 0) {
+        return -1; // Process doesn't exist or error
+    }
+    return proc_info.pbi_ppid;
+}
+
+// Function to get WRAPPER value from process environment variables
+static char* get_wrapper_from_env_process(pid_t pid) {
+    static char wrapper_value[256];
+
+    // Get the full process args and environment data
+    int mib[3] = { CTL_KERN, KERN_PROCARGS2, pid };
+    size_t size = 0;
+
+    if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0) {
+        fprintf(stderr, "    sysctl size query failed for PID %d (errno=%d)\n", pid, errno);
+        return NULL;
+    }
+
+    // Sanity check the size
+    if (size < sizeof(int) || size > 1024 * 1024) { // Max 1MB seems reasonable
+        fprintf(stderr, "    suspicious size %zu for PID %d, aborting\n", size, pid);
+        return NULL;
+    }
+
+    char *proc_data = malloc(size);
+    if (!proc_data) {
+        fprintf(stderr, "    malloc failed for PID %d\n", pid);
+        return NULL;
+    }
+
+    if (sysctl(mib, 3, proc_data, &size, NULL, 0) != 0) {
+        fprintf(stderr, "    sysctl data query failed for PID %d (errno=%d)\n", pid, errno);
+        free(proc_data);
+        return NULL;
+    }
+
+    // Bounds checking - ensure we have at least space for argc
+    if (size < sizeof(int)) {
+        fprintf(stderr, "    insufficient data for PID %d (size=%zu)\n", pid, size);
+        free(proc_data);
+        return NULL;
+    }
+
+    // Format: argc, then executable path, then args, then env
+    int argc = *(int*)proc_data;
+    char *ptr = proc_data + sizeof(int);
+    char *data_end = proc_data + size;
+
+    // Sanity check argc
+    if (argc < 0 || argc > 1000) { // Reasonable limit
+        fprintf(stderr, "    suspicious argc %d for PID %d, aborting\n", argc, pid);
+        free(proc_data);
+        return NULL;
+    }
+
+    fprintf(stderr, "    PID %d has %d args, checking environment...\n", pid, argc);
+
+    // Skip over the executable path with bounds checking
+    if (ptr >= data_end) {
+        fprintf(stderr, "    no space for executable path in PID %d\n", pid);
+        free(proc_data);
+        return NULL;
+    }
+
+    size_t exec_len = strnlen(ptr, data_end - ptr);
+    if (exec_len == (size_t)(data_end - ptr)) {
+        fprintf(stderr, "    unterminated executable path in PID %d\n", pid);
+        free(proc_data);
+        return NULL;
+    }
+    ptr += exec_len + 1;
+
+    // Skip any null padding after executable path
+    while (ptr < data_end && *ptr == '\0') {
+        ptr++;
+    }
+
+    // Skip over all the arguments with bounds checking
+    for (int i = 0; i < argc && ptr < data_end; i++) {
+        if (*ptr != '\0') {
+            size_t arg_len = strnlen(ptr, data_end - ptr);
+            if (arg_len == (size_t)(data_end - ptr)) {
+                fprintf(stderr, "    unterminated arg[%d] in PID %d\n", i, pid);
+                free(proc_data);
+                return NULL;
+            }
+            fprintf(stderr, "    arg[%d]: %.*s\n", i, (int)arg_len, ptr);
+            ptr += arg_len + 1;
+        } else {
+            ptr++;
+        }
+    }
+
+    // Now we're at the environment variables
+    int env_count = 0;
+    // Look through environment variables for WRAPPER=value with bounds checking
+    while (ptr < data_end && *ptr != '\0') {
+        size_t env_len = strnlen(ptr, data_end - ptr);
+        if (env_len == (size_t)(data_end - ptr)) {
+            fprintf(stderr, "    unterminated env var #%d in PID %d\n", env_count + 1, pid);
+            break;
+        }
+
+        env_count++;
+        if (env_len >= 8 && strncmp(ptr, "WRAPPER=", 8) == 0) {
+            // Found WRAPPER= environment variable, extract the value
+            size_t value_len = env_len - 8;
+            if (value_len >= sizeof(wrapper_value)) {
+                value_len = sizeof(wrapper_value) - 1;
+            }
+            strncpy(wrapper_value, ptr + 8, value_len);
+            wrapper_value[value_len] = '\0';
+            fprintf(stderr, "    Found WRAPPER=%s (env var #%d)\n", wrapper_value, env_count);
+            free(proc_data);
+            return wrapper_value;
+        }
+        ptr += env_len + 1;
+    }
+
+    fprintf(stderr, "    Checked %d environment variables, no WRAPPER found\n", env_count);
+    free(proc_data);
+    return NULL;
+}
+
+// Function to build redirected path based on wrapper value
+static void build_redirected_path(const char* original_path, const char* wrapper_value, char* result_buf, size_t buf_size) {
+    // Special case: if original_path is just "/", return the wrapper_value directory
+    if (strcmp(original_path, "/") == 0) {
+        strncpy(result_buf, wrapper_value, buf_size - 1);
+        result_buf[buf_size - 1] = '\0';
+        return;
+    }
+
+    // If wrapper_value ends with '/', remove it to avoid double slashes
+    size_t wrapper_len = strlen(wrapper_value);
+    if (wrapper_len > 0 && wrapper_value[wrapper_len - 1] == '/') {
+        snprintf(result_buf, buf_size, "%.*s%s",
+                (int)(wrapper_len - 1), wrapper_value, original_path);
+    } else {
+        snprintf(result_buf, buf_size, "%s%s",
+                wrapper_value, original_path);
+    }
+}
+
+// Structure to hold wrapper detection results
+struct wrapper_info {
+    int found;
+    pid_t pid;
+    char value[256];
+};
+
+// Forward declaration
+static struct wrapper_info find_wrapper_in_tree(pid_t starting_pid);
+
+// Helper function to apply wrapper detection and path redirection
+static const char* apply_wrapper_redirect_with_buffer(const char* path, const char* operation_name, char* result_buf, size_t buf_size) {
+    struct fuse_context *context = fuse_get_context();
+    if (context) {
+        struct wrapper_info wrapper = find_wrapper_in_tree(context->pid);
+        if (wrapper.found && strlen(wrapper.value) > 0) {
+            // Wrapper detected - redirect to wrapper path
+            build_redirected_path(path, wrapper.value, result_buf, buf_size);
+            fprintf(stderr, "*** %s REDIRECT: %s -> %s ***\n", operation_name, path, result_buf);
+            return result_buf;
+        }
+    }
+
+    // No wrapper - pass through to backup location (original content)
+    if (loopback.backup_created) {
+        build_redirected_path(path, loopback.backup_path, result_buf, buf_size);
+        fprintf(stderr, "*** %s PASSTHROUGH: %s -> %s ***\n", operation_name, path, result_buf);
+        return result_buf;
+    }
+
+    return path;
+}
+
+// Function to find WRAPPER environment variable in process tree
+static struct wrapper_info find_wrapper_in_tree(pid_t starting_pid) {
+    struct wrapper_info result = { .found = 0, .pid = -1, .value = "" };
+    pid_t current_pid = starting_pid;
+    int depth = 0;
+
+    fprintf(stderr, "Searching for WRAPPER in process tree starting from PID %d:\n", starting_pid);
+
+    while (current_pid > 1 && depth < 10) {
+        char proc_name[PROC_PIDPATHINFO_MAXSIZE];
+        char *basename = "<unknown>";
+
+        // Get process name
+        if (proc_pidpath(current_pid, proc_name, sizeof(proc_name)) > 0) {
+            char *slash = strrchr(proc_name, '/');
+            if (slash) {
+                basename = slash + 1;
+            } else {
+                basename = proc_name;
+            }
+        }
+
+        // Check if this process has WRAPPER in its environment variables
+        char *wrapper_value = get_wrapper_from_env_process(current_pid);
+        int has_wrapper = 0;
+
+        if (wrapper_value) {
+            has_wrapper = 1;
+            fprintf(stderr, "  Found WRAPPER=%s in %s process environment!\n", wrapper_value, basename);
+        } else {
+            // Also check if the process name contains "wrapper" (legacy check)
+            has_wrapper = (strstr(basename, "wrapper") != NULL);
+        }
+
+        fprintf(stderr, "  PID %d (%s): %s\n",
+                current_pid, basename,
+                has_wrapper ? "HAS WRAPPER!" : "no wrapper");
+
+        if (has_wrapper) {
+            result.found = 1;
+            result.pid = current_pid;
+            if (wrapper_value) {
+                strncpy(result.value, wrapper_value, sizeof(result.value) - 1);
+                result.value[sizeof(result.value) - 1] = '\0';
+                fprintf(stderr, "Found WRAPPER=%s at PID %d!\n", wrapper_value, current_pid);
+            } else {
+                fprintf(stderr, "Found WRAPPER process at PID %d!\n", current_pid);
+            }
+            return result;
+        }
+
+        // Get parent PID
+        pid_t parent_pid = get_parent_pid(current_pid);
+        if (parent_pid <= 0) {
+            break;
+        }
+
+        current_pid = parent_pid;
+        depth++;
+    }
+
+    fprintf(stderr, "No WRAPPER found in process tree\n");
+    return result;
+}
+
+// Function to print process tree for debugging
+static void print_process_tree(pid_t starting_pid) {
+    pid_t current_pid = starting_pid;
+    char proc_name[PROC_PIDPATHINFO_MAXSIZE];
+
+    fprintf(stderr, "Process tree for PID %d:\n", starting_pid);
+
+    int depth = 0;
+    while (current_pid > 1 && depth < 10) { // Limit depth to avoid infinite loops
+        // Get process name
+        if (proc_pidpath(current_pid, proc_name, sizeof(proc_name)) > 0) {
+            // Extract just the executable name from full path
+            char *basename = strrchr(proc_name, '/');
+            if (basename) {
+                basename++;
+            } else {
+                basename = proc_name;
+            }
+
+            // Print with indentation
+            for (int i = 0; i < depth; i++) fprintf(stderr, "  ");
+            fprintf(stderr, "PID %d: %s\n", current_pid, basename);
+        } else {
+            for (int i = 0; i < depth; i++) fprintf(stderr, "  ");
+            fprintf(stderr, "PID %d: <unknown>\n", current_pid);
+        }
+
+        // Get parent PID
+        pid_t parent_pid = get_parent_pid(current_pid);
+        if (parent_pid <= 0) {
+            break;
+        }
+
+        current_pid = parent_pid;
+        depth++;
+    }
+    fprintf(stderr, "\n");
+}
 
 static int
 loopback_getattr(const char *path, struct stat *stbuf)
 {
     int res;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "GETATTR", path_redirected, sizeof(path_redirected));
 
     res = lstat(path, stbuf);
 
@@ -101,6 +503,9 @@ static int
 loopback_access(const char *path, int mask)
 {
     int res;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "ACCESS", path_redirected, sizeof(path_redirected));
 
     /*
      * Standard access permission flags:
@@ -139,6 +544,9 @@ static int
 loopback_readlink(const char *path, char *buf, size_t size)
 {
     int res;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "READLINK", path_redirected, sizeof(path_redirected));
 
     res = readlink(path, buf, size - 1);
     if (res == -1) {
@@ -160,6 +568,9 @@ static int
 loopback_opendir(const char *path, struct fuse_file_info *fi)
 {
     int res;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "OPENDIR", path_redirected, sizeof(path_redirected));
 
     struct loopback_dirp *d = malloc(sizeof(struct loopback_dirp));
     if (d == NULL) {
@@ -256,6 +667,10 @@ static int
 loopback_mknod(const char *path, mode_t mode, dev_t rdev)
 {
     int res;
+    struct fuse_context *context = fuse_get_context();
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "MKNOD", path_redirected, sizeof(path_redirected));
 
     if (S_ISFIFO(mode)) {
         res = mkfifo(path, mode);
@@ -267,6 +682,11 @@ loopback_mknod(const char *path, mode_t mode, dev_t rdev)
         return -errno;
     }
 
+    // Set proper ownership to the calling user
+    if (context && chown(path, context->uid, context->gid) == -1) {
+        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", path, strerror(errno));
+    }
+
     return 0;
 }
 
@@ -274,10 +694,19 @@ static int
 loopback_mkdir(const char *path, mode_t mode)
 {
     int res;
+    struct fuse_context *context = fuse_get_context();
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "MKDIR", path_redirected, sizeof(path_redirected));
 
     res = mkdir(path, mode);
     if (res == -1) {
         return -errno;
+    }
+
+    // Set proper ownership to the calling user
+    if (context && chown(path, context->uid, context->gid) == -1) {
+        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", path, strerror(errno));
     }
 
     return 0;
@@ -287,6 +716,9 @@ static int
 loopback_unlink(const char *path)
 {
     int res;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "UNLINK", path_redirected, sizeof(path_redirected));
 
     res = unlink(path);
     if (res == -1) {
@@ -300,6 +732,9 @@ static int
 loopback_rmdir(const char *path)
 {
     int res;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "RMDIR", path_redirected, sizeof(path_redirected));
 
     res = rmdir(path);
     if (res == -1) {
@@ -313,6 +748,9 @@ static int
 loopback_symlink(const char *from, const char *to)
 {
     int res;
+    static char to_redirected[PATH_MAX];
+
+    to = apply_wrapper_redirect_with_buffer(to, "SYMLINK", to_redirected, sizeof(to_redirected));
 
     res = symlink(from, to);
     if (res == -1) {
@@ -326,6 +764,11 @@ static int
 loopback_rename(const char *from, const char *to)
 {
     int res;
+    static char from_redirected[PATH_MAX];
+    static char to_redirected[PATH_MAX];
+
+    from = apply_wrapper_redirect_with_buffer(from, "RENAME1", from_redirected, sizeof(from_redirected));
+    to = apply_wrapper_redirect_with_buffer(to, "RENAME2", to_redirected, sizeof(to_redirected));
 
     res = rename(from, to);
     if (res == -1) {
@@ -341,6 +784,11 @@ static int
 loopback_exchange(const char *path1, const char *path2, unsigned long options)
 {
     int res;
+    static char path1_redirected[PATH_MAX];
+    static char path2_redirected[PATH_MAX];
+
+    path1 = apply_wrapper_redirect_with_buffer(path1, "EXCHANGE1", path1_redirected, sizeof(path1_redirected));
+    path2 = apply_wrapper_redirect_with_buffer(path2, "EXCHANGE2", path2_redirected, sizeof(path2_redirected));
 
     res = exchangedata(path1, path2, options);
     if (res == -1) {
@@ -491,6 +939,9 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
     int res;
     uid_t uid = -1;
     gid_t gid = -1;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "SETATTR_X", path_redirected, sizeof(path_redirected));
 
     if (SETATTR_WANTS_MODE(attr)) {
         res = lchmod(path, attr->mode);
@@ -610,6 +1061,9 @@ loopback_getxtimes(const char *path, struct timespec *bkuptime,
 {
     int res = 0;
     struct attrlist attributes;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "GETXTIMES", path_redirected, sizeof(path_redirected));
 
     attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
     attributes.reserved    = 0;
@@ -649,10 +1103,19 @@ static int
 loopback_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     int fd;
+    struct fuse_context *context = fuse_get_context();
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "CREATE", path_redirected, sizeof(path_redirected));
 
     fd = open(path, fi->flags, mode);
     if (fd == -1) {
         return -errno;
+    }
+
+    // Set proper ownership to the calling user
+    if (context && fchown(fd, context->uid, context->gid) == -1) {
+        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", path, strerror(errno));
     }
 
     fi->fh = fd;
@@ -663,6 +1126,9 @@ static int
 loopback_open(const char *path, struct fuse_file_info *fi)
 {
     int fd;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "OPEN", path_redirected, sizeof(path_redirected));
 
     fd = open(path, fi->flags);
     if (fd == -1) {
@@ -751,6 +1217,9 @@ loopback_setxattr(const char *path, const char *name, const char *value,
                   size_t size, int flags, uint32_t position)
 {
     int res;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "SETXATTR", path_redirected, sizeof(path_redirected));
 
     flags |= XATTR_NOFOLLOW;
     if (strncmp(name, "com.apple.", 10) == 0) {
@@ -774,6 +1243,9 @@ loopback_getxattr(const char *path, const char *name, char *value, size_t size,
                   uint32_t position)
 {
     int res;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "GETXATTR", path_redirected, sizeof(path_redirected));
 
     if (strncmp(name, "com.apple.", 10) == 0) {
         char new_name[MAXPATHLEN] = "org.apple.";
@@ -794,6 +1266,10 @@ loopback_getxattr(const char *path, const char *name, char *value, size_t size,
 static int
 loopback_listxattr(const char *path, char *list, size_t size)
 {
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "LISTXATTR", path_redirected, sizeof(path_redirected));
+
     ssize_t res = listxattr(path, list, size, XATTR_NOFOLLOW);
     if (res > 0) {
         if (list) {
@@ -831,6 +1307,9 @@ static int
 loopback_removexattr(const char *path, const char *name)
 {
     int res;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "REMOVEXATTR", path_redirected, sizeof(path_redirected));
 
     if (strncmp(name, "com.apple.", 10) == 0) {
         char new_name[MAXPATHLEN] = "org.apple.";
@@ -892,6 +1371,9 @@ static int
 loopback_statfs_x(const char *path, struct statfs *stbuf)
 {
     int res;
+    static char path_redirected[PATH_MAX];
+
+    path = apply_wrapper_redirect_with_buffer(path, "STATFS", path_redirected, sizeof(path_redirected));
 
     res = statfs(path, stbuf);
     if (res == -1) {
@@ -912,6 +1394,11 @@ static int
 loopback_renamex(const char *path1, const char *path2, unsigned int flags)
 {
     int res;
+    static char path1_redirected[PATH_MAX];
+    static char path2_redirected[PATH_MAX];
+
+    path1 = apply_wrapper_redirect_with_buffer(path1, "RENAMEX1", path1_redirected, sizeof(path1_redirected));
+    path2 = apply_wrapper_redirect_with_buffer(path2, "RENAMEX2", path2_redirected, sizeof(path2_redirected));
 
     res = renamex_np(path1, path2, flags);
     if (res == -1) {
@@ -944,7 +1431,7 @@ loopback_init(struct fuse_conn_info *conn)
 void
 loopback_destroy(void *userdata)
 {
-    /* nothing */
+    /* nothing - backup restoration happens in main() after fuse_main() */
 }
 
 static struct fuse_operations loopback_oper = {
@@ -1008,12 +1495,39 @@ main(int argc, char *argv[])
 
     loopback.blocksize = 4096;
     loopback.case_insensitive = 0;
+    loopback.mount_point[0] = '\0';
+    loopback.mount_point_len = 0;
+    loopback.backup_path[0] = '\0';
+    loopback.backup_created = false;
+
     if (fuse_opt_parse(&args, &loopback, loopback_opts, NULL) == -1) {
         exit(1);
     }
 
+    // Find the mount point from command line arguments
+    // Look for the first argument that looks like a path (starts with /)
+    for (int i = 1; i < args.argc; i++) {
+        if (args.argv[i][0] == '/') {
+            strncpy(loopback.mount_point, args.argv[i], sizeof(loopback.mount_point) - 1);
+            loopback.mount_point[sizeof(loopback.mount_point) - 1] = '\0';
+            loopback.mount_point_len = strlen(loopback.mount_point);
+            fprintf(stderr, "Mount point set to: %s (len=%zu)\n", loopback.mount_point, loopback.mount_point_len);
+            break;
+        }
+    }
+
+    // Create backup of mount point before starting FUSE
+    if (create_mount_point_backup() != 0) {
+        fprintf(stderr, "Failed to create backup, cannot proceed\n");
+        fuse_opt_free_args(&args);
+        return 1;
+    }
+
     umask(0);
     res = fuse_main(args.argc, args.argv, &loopback_oper, NULL);
+
+    // Restore backup after FUSE exits
+    restore_mount_point_backup();
 
     fuse_opt_free_args(&args);
     return res;
