@@ -44,6 +44,7 @@
 
 struct path {
     bool fail;
+    int error_code;  // errno value to return (e.g., ENOENT for whiteout)
     char value[PATH_MAX];
 };
 
@@ -182,8 +183,9 @@ static pid_t get_parent_pid(pid_t pid) {
     return proc_info.pbi_ppid;
 }
 
-// Function to get WRAPPER value from process environment variables
-static bool get_wrapper_from_env_process(pid_t pid, char* result_buffer, size_t buffer_size) {
+// Function to get specific environment variable value from process
+static struct path get_env_from_process(pid_t pid, const char* env_name) {
+    struct path result = { .fail = true, .error_code = 0 };
 
     // Get the full process args and environment data
     int mib[3] = { CTL_KERN, KERN_PROCARGS2, pid };
@@ -191,32 +193,32 @@ static bool get_wrapper_from_env_process(pid_t pid, char* result_buffer, size_t 
 
     if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0) {
         fprintf(stderr, "    sysctl size query failed for PID %d (errno=%d)\n", pid, errno);
-        return false;
+        return result;
     }
 
     // Sanity check the size
     if (size < sizeof(int) || size > 1024 * 1024) { // Max 1MB seems reasonable
         fprintf(stderr, "    suspicious size %zu for PID %d, aborting\n", size, pid);
-        return false;
+        return result;
     }
 
     char *proc_data = malloc(size);
     if (!proc_data) {
         fprintf(stderr, "    malloc failed for PID %d\n", pid);
-        return false;
+        return result;
     }
 
     if (sysctl(mib, 3, proc_data, &size, NULL, 0) != 0) {
         fprintf(stderr, "    sysctl data query failed for PID %d (errno=%d)\n", pid, errno);
         free(proc_data);
-        return false;
+        return result;
     }
 
     // Bounds checking - ensure we have at least space for argc
     if (size < sizeof(int)) {
         fprintf(stderr, "    insufficient data for PID %d (size=%zu)\n", pid, size);
         free(proc_data);
-        return false;
+        return result;
     }
 
     // Format: argc, then executable path, then args, then env
@@ -228,7 +230,7 @@ static bool get_wrapper_from_env_process(pid_t pid, char* result_buffer, size_t 
     if (argc < 0 || argc > 1000) { // Reasonable limit
         fprintf(stderr, "    suspicious argc %d for PID %d, aborting\n", argc, pid);
         free(proc_data);
-        return false;
+        return result;
     }
 
     fprintf(stderr, "    PID %d has %d args, checking environment...\n", pid, argc);
@@ -237,14 +239,14 @@ static bool get_wrapper_from_env_process(pid_t pid, char* result_buffer, size_t 
     if (ptr >= data_end) {
         fprintf(stderr, "    no space for executable path in PID %d\n", pid);
         free(proc_data);
-        return false;
+        return result;
     }
 
     size_t exec_len = strnlen(ptr, data_end - ptr);
     if (exec_len == (size_t)(data_end - ptr)) {
         fprintf(stderr, "    unterminated executable path in PID %d\n", pid);
         free(proc_data);
-        return false;
+        return result;
     }
     ptr += exec_len + 1;
 
@@ -260,7 +262,7 @@ static bool get_wrapper_from_env_process(pid_t pid, char* result_buffer, size_t 
             if (arg_len == (size_t)(data_end - ptr)) {
                 fprintf(stderr, "    unterminated arg[%d] in PID %d\n", i, pid);
                 free(proc_data);
-                return false;
+                return result;
             }
             fprintf(stderr, "    arg[%d]: %.*s\n", i, (int)arg_len, ptr);
             ptr += arg_len + 1;
@@ -271,7 +273,10 @@ static bool get_wrapper_from_env_process(pid_t pid, char* result_buffer, size_t 
 
     // Now we're at the environment variables
     int env_count = 0;
-    // Look through environment variables for WRAPPER=value with bounds checking
+    size_t env_name_len = strlen(env_name);
+    size_t search_len = env_name_len + 1; // +1 for the '=' sign
+
+    // Look through environment variables for env_name=value with bounds checking
     while (ptr < data_end && *ptr != '\0') {
         size_t env_len = strnlen(ptr, data_end - ptr);
         if (env_len == (size_t)(data_end - ptr)) {
@@ -280,59 +285,126 @@ static bool get_wrapper_from_env_process(pid_t pid, char* result_buffer, size_t 
         }
 
         env_count++;
-        if (env_len >= 8 && strncmp(ptr, "WRAPPER=", 8) == 0) {
-            // Found WRAPPER= environment variable, extract the value
-            size_t value_len = env_len - 8;
-            if (value_len >= buffer_size) {
-                value_len = buffer_size - 1;
+        if (env_len >= search_len && strncmp(ptr, env_name, env_name_len) == 0 && ptr[env_name_len] == '=') {
+            // Found env_name= environment variable, extract the value
+            size_t value_len = env_len - search_len;
+            if (value_len < sizeof(result.value)) {
+                strncpy(result.value, ptr + search_len, value_len);
+                result.value[value_len] = '\0';
+                result.fail = false;
+                fprintf(stderr, "    Found %s=%s (env var #%d)\n", env_name, result.value, env_count);
+                free(proc_data);
+                return result;
             }
-            strncpy(result_buffer, ptr + 8, value_len);
-            result_buffer[value_len] = '\0';
-            fprintf(stderr, "    Found WRAPPER=%s (env var #%d)\n", result_buffer, env_count);
-            free(proc_data);
-            return true;
         }
         ptr += env_len + 1;
     }
 
-    fprintf(stderr, "    Checked %d environment variables, no WRAPPER found\n", env_count);
+    fprintf(stderr, "    Checked %d environment variables, no %s found\n", env_count, env_name);
     free(proc_data);
-    return false;
+    return result;
 }
 
 // Function to build redirected path based on wrapper value
-static void build_redirected_path(const char* original_path, const char* wrapper_value, char* result_buf, size_t buf_size) {
+static struct path build_redirected_path(const char* original_path, const char* wrapper_value) {
+    struct path result = { .fail = false, .error_code = 0 };
+
     // Special case: if original_path is just "/", return the wrapper_value directory
     if (strcmp(original_path, "/") == 0) {
-        strncpy(result_buf, wrapper_value, buf_size - 1);
-        result_buf[buf_size - 1] = '\0';
-        return;
+        strncpy(result.value, wrapper_value, sizeof(result.value) - 1);
+        result.value[sizeof(result.value) - 1] = '\0';
+        return result;
     }
 
     // If wrapper_value ends with '/', remove it to avoid double slashes
     size_t wrapper_len = strlen(wrapper_value);
     if (wrapper_len > 0 && wrapper_value[wrapper_len - 1] == '/') {
-        snprintf(result_buf, buf_size, "%.*s%s",
+        snprintf(result.value, sizeof(result.value), "%.*s%s",
                 (int)(wrapper_len - 1), wrapper_value, original_path);
     } else {
-        snprintf(result_buf, buf_size, "%s%s",
+        snprintf(result.value, sizeof(result.value), "%s%s",
                 wrapper_value, original_path);
     }
+
+    return result;
 }
 
-// Structure to hold wrapper detection results
-struct wrapper_info {
+// Function to determine where a file exists in the overlay
+static overlay_location_t find_overlay_file_location(const char* original_path, const struct overlay_info* overlay,
+                                                     char* result_path, size_t result_size) {
+    struct stat st;
+
+    // Build paths for upper, lower, and whiteout locations
+    struct path upper_path_struct = build_redirected_path(original_path, overlay->upper_dir);
+    struct path lower_path_struct = build_redirected_path(original_path, overlay->lower_dir);
+
+    char whiteout_path[PATH_MAX];
+
+    // Whiteout path: upper_dir/.deleted/original_path
+    if (strcmp(original_path, "/") == 0) {
+        snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted", overlay->upper_dir);
+    } else {
+        snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted%s", overlay->upper_dir, original_path);
+    }
+
+    fprintf(stderr, "    Checking overlay locations for %s:\n", original_path);
+    fprintf(stderr, "      Upper: %s\n", upper_path_struct.value);
+    fprintf(stderr, "      Lower: %s\n", lower_path_struct.value);
+    fprintf(stderr, "      Whiteout: %s\n", whiteout_path);
+
+    // 1. Check if file is whiteout (deleted)
+    if (lstat(whiteout_path, &st) == 0) {
+        fprintf(stderr, "      -> WHITEOUT (file deleted)\n");
+        strncpy(result_path, whiteout_path, result_size - 1);
+        result_path[result_size - 1] = '\0';
+        return OVERLAY_WHITEOUT;
+    }
+
+    // 2. Check upper layer first
+    if (lstat(upper_path_struct.value, &st) == 0) {
+        fprintf(stderr, "      -> UPPER (found in upper layer)\n");
+        strncpy(result_path, upper_path_struct.value, result_size - 1);
+        result_path[result_size - 1] = '\0';
+        return OVERLAY_UPPER;
+    }
+
+    // 3. Check lower layer
+    if (lstat(lower_path_struct.value, &st) == 0) {
+        fprintf(stderr, "      -> LOWER (found in lower layer)\n");
+        strncpy(result_path, lower_path_struct.value, result_size - 1);
+        result_path[result_size - 1] = '\0';
+        return OVERLAY_LOWER;
+    }
+
+    // 4. File doesn't exist anywhere
+    fprintf(stderr, "      -> NONE (file not found)\n");
+    strncpy(result_path, upper_path_struct.value, result_size - 1);  // Default to upper for new files
+    result_path[result_size - 1] = '\0';
+    return OVERLAY_NONE;
+}
+
+// File location enumeration for overlay filesystem
+typedef enum {
+    OVERLAY_UPPER,      // File exists in upper layer
+    OVERLAY_LOWER,      // File exists in lower layer
+    OVERLAY_WHITEOUT,   // File is marked as deleted
+    OVERLAY_NONE        // File doesn't exist anywhere
+} overlay_location_t;
+
+// Structure to hold overlay detection results
+struct overlay_info {
     int found;
     pid_t pid;
-    char value[256];
+    char upper_dir[256];
+    char lower_dir[256];
 };
 
 // Forward declaration
-static struct wrapper_info find_wrapper_in_tree(pid_t starting_pid);
+static struct overlay_info find_overlay_in_tree(pid_t starting_pid);
 
 // Helper function to apply wrapper detection and path redirection
 static struct path apply_wrapper_redirect_with_context(const char* original_path, const char* operation_name, struct fuse_context *context) {
-    struct path result = { .fail = false };
+    struct path result = { .fail = false, .error_code = 0 };
 
     if (context) {
         // Check if this is fseventsd - return early to avoid conflicts
@@ -344,22 +416,43 @@ static struct path apply_wrapper_redirect_with_context(const char* original_path
             if (strcmp(basename, "fseventsd") == 0) {
                 fprintf(stderr, "*** %s BLOCKING fseventsd PID %d ***\n", operation_name, context->pid);
                 result.fail = true;
+                result.error_code = ENOTSUP;
                 return result;
             }
         }
 
-        struct wrapper_info wrapper = find_wrapper_in_tree(context->pid);
-        if (wrapper.found && strlen(wrapper.value) > 0) {
-            // Wrapper detected - redirect to wrapper path
-            build_redirected_path(original_path, wrapper.value, result.value, sizeof(result.value));
-            fprintf(stderr, "*** %s REDIRECT: %s -> %s ***\n", operation_name, original_path, result.value);
-            return result;
+        struct overlay_info overlay = find_overlay_in_tree(context->pid);
+        if (overlay.found && strlen(overlay.upper_dir) > 0) {
+            // Overlay detected - use file location detection for proper overlay behavior
+            overlay_location_t location = find_overlay_file_location(original_path, &overlay, result.value, sizeof(result.value));
+
+            switch (location) {
+                case OVERLAY_WHITEOUT:
+                    fprintf(stderr, "*** %s OVERLAY WHITEOUT: %s (file deleted) ***\n", operation_name, original_path);
+                    result.fail = true;
+                    result.error_code = ENOENT;  // Return ENOENT for whiteout files
+                    return result;
+
+                case OVERLAY_UPPER:
+                    fprintf(stderr, "*** %s OVERLAY UPPER: %s -> %s ***\n", operation_name, original_path, result.value);
+                    return result;
+
+                case OVERLAY_LOWER:
+                    fprintf(stderr, "*** %s OVERLAY LOWER: %s -> %s ***\n", operation_name, original_path, result.value);
+                    return result;
+
+                case OVERLAY_NONE:
+                    fprintf(stderr, "*** %s OVERLAY NEW: %s -> %s (will create in upper) ***\n", operation_name, original_path, result.value);
+                    return result;
+            }
         }
     }
 
     // No wrapper - pass through to backup location (original content)
     if (loopback.backup_created) {
-        build_redirected_path(original_path, loopback.backup_path, result.value, sizeof(result.value));
+        struct path backup_path = build_redirected_path(original_path, loopback.backup_path);
+        strncpy(result.value, backup_path.value, sizeof(result.value) - 1);
+        result.value[sizeof(result.value) - 1] = '\0';
         fprintf(stderr, "*** %s PASSTHROUGH: %s -> %s ***\n", operation_name, original_path, result.value);
         return result;
     }
@@ -369,29 +462,32 @@ static struct path apply_wrapper_redirect_with_context(const char* original_path
     return result;
 }
 
-// Function to find WRAPPER environment variable in process tree
-static struct wrapper_info find_wrapper_in_tree(pid_t starting_pid) {
-    struct wrapper_info result = { .found = 0, .pid = -1, .value = "" };
+// Function to find WRAPPER_UPPER and WRAPPER_LOWER environment variables in process tree
+static struct overlay_info find_overlay_in_tree(pid_t starting_pid) {
+    struct overlay_info result = { .found = 0, .pid = -1, .upper_dir = "", .lower_dir = "" };
     pid_t current_pid = starting_pid;
     int depth = 0;
 
-    fprintf(stderr, "Searching for WRAPPER in process tree starting from PID %d:\n", starting_pid);
+    fprintf(stderr, "Searching for WRAPPER_UPPER/WRAPPER_LOWER in process tree starting from PID %d:\n", starting_pid);
 
     while (current_pid > 1 && depth < 10) {
-        // Check if this process has WRAPPER in its environment variables
-        char wrapper_value[256];
-        bool found_wrapper = get_wrapper_from_env_process(current_pid, wrapper_value, sizeof(wrapper_value));
+        // Check if this process has WRAPPER_UPPER and WRAPPER_LOWER in its environment variables
+        struct path upper_env = get_env_from_process(current_pid, "WRAPPER_UPPER");
+        struct path lower_env = get_env_from_process(current_pid, "WRAPPER_LOWER");
 
-        fprintf(stderr, "  PID %d: %s\n",
+        fprintf(stderr, "  PID %d: upper=%s, lower=%s\n",
                 current_pid,
-                found_wrapper ? "HAS WRAPPER!" : "no wrapper");
+                !upper_env.fail ? "YES" : "no",
+                !lower_env.fail ? "YES" : "no");
 
-        if (found_wrapper) {
+        if (!upper_env.fail && !lower_env.fail) {
             result.found = 1;
             result.pid = current_pid;
-            strncpy(result.value, wrapper_value, sizeof(result.value) - 1);
-            result.value[sizeof(result.value) - 1] = '\0';
-            fprintf(stderr, "Found WRAPPER=%s at PID %d!\n", wrapper_value, current_pid);
+            strncpy(result.upper_dir, upper_env.value, sizeof(result.upper_dir) - 1);
+            result.upper_dir[sizeof(result.upper_dir) - 1] = '\0';
+            strncpy(result.lower_dir, lower_env.value, sizeof(result.lower_dir) - 1);
+            result.lower_dir[sizeof(result.lower_dir) - 1] = '\0';
+            fprintf(stderr, "Found WRAPPER_UPPER=%s WRAPPER_LOWER=%s at PID %d!\n", upper_env.value, lower_env.value, current_pid);
             return result;
         }
 
@@ -456,7 +552,7 @@ loopback_getattr(const char *path, struct stat *stbuf)
     struct path redirected = apply_wrapper_redirect_with_context(path, "GETATTR", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     res = lstat(redirected.value, stbuf);
@@ -505,7 +601,7 @@ loopback_access(const char *path, int mask)
     struct path redirected = apply_wrapper_redirect_with_context(path, "ACCESS", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     /*
@@ -549,7 +645,7 @@ loopback_readlink(const char *path, char *buf, size_t size)
     struct path redirected = apply_wrapper_redirect_with_context(path, "READLINK", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     res = readlink(redirected.value, buf, size - 1);
@@ -576,7 +672,7 @@ loopback_opendir(const char *path, struct fuse_file_info *fi)
     struct path redirected = apply_wrapper_redirect_with_context(path, "OPENDIR", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     struct loopback_dirp *d = malloc(sizeof(struct loopback_dirp));
@@ -678,7 +774,7 @@ loopback_mknod(const char *path, mode_t mode, dev_t rdev)
     struct path redirected = apply_wrapper_redirect_with_context(path, "MKNOD", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     if (S_ISFIFO(mode)) {
@@ -707,7 +803,7 @@ loopback_mkdir(const char *path, mode_t mode)
     struct path redirected = apply_wrapper_redirect_with_context(path, "MKDIR", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     res = mkdir(redirected.value, mode);
@@ -731,7 +827,7 @@ loopback_unlink(const char *path)
     struct path redirected = apply_wrapper_redirect_with_context(path, "UNLINK", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     res = unlink(redirected.value);
@@ -750,7 +846,7 @@ loopback_rmdir(const char *path)
     struct path redirected = apply_wrapper_redirect_with_context(path, "RMDIR", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     res = rmdir(redirected.value);
@@ -769,7 +865,7 @@ loopback_symlink(const char *from, const char *to)
     struct path redirected = apply_wrapper_redirect_with_context(to, "SYMLINK", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     res = symlink(from, redirected.value);
@@ -967,7 +1063,7 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
     struct path redirected = apply_wrapper_redirect_with_context(path, "SETATTR_X", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     if (SETATTR_WANTS_MODE(attr)) {
@@ -1092,7 +1188,7 @@ loopback_getxtimes(const char *path, struct timespec *bkuptime,
     struct path redirected = apply_wrapper_redirect_with_context(path, "GETXTIMES", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
@@ -1137,7 +1233,7 @@ loopback_create(const char *path, mode_t mode, struct fuse_file_info *fi)
     struct path redirected = apply_wrapper_redirect_with_context(path, "CREATE", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     fd = open(redirected.value, fi->flags, mode);
@@ -1162,7 +1258,7 @@ loopback_open(const char *path, struct fuse_file_info *fi)
     struct path redirected = apply_wrapper_redirect_with_context(path, "OPEN", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     fd = open(redirected.value, fi->flags);
@@ -1256,7 +1352,7 @@ loopback_setxattr(const char *path, const char *name, const char *value,
     struct path redirected = apply_wrapper_redirect_with_context(path, "SETXATTR", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     flags |= XATTR_NOFOLLOW;
@@ -1285,7 +1381,7 @@ loopback_getxattr(const char *path, const char *name, char *value, size_t size,
     struct path redirected = apply_wrapper_redirect_with_context(path, "GETXATTR", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     if (strncmp(name, "com.apple.", 10) == 0) {
@@ -1311,7 +1407,7 @@ loopback_listxattr(const char *path, char *list, size_t size)
     struct path redirected = apply_wrapper_redirect_with_context(path, "LISTXATTR", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     ssize_t res = listxattr(redirected.value, list, size, XATTR_NOFOLLOW);
@@ -1355,7 +1451,7 @@ loopback_removexattr(const char *path, const char *name)
     struct path redirected = apply_wrapper_redirect_with_context(path, "REMOVEXATTR", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     if (strncmp(name, "com.apple.", 10) == 0) {
@@ -1422,7 +1518,7 @@ loopback_statfs_x(const char *path, struct statfs *stbuf)
     struct path redirected = apply_wrapper_redirect_with_context(path, "STATFS", context);
 
     if (redirected.fail) {
-        return -ENOTSUP;
+        return -redirected.error_code;
     }
 
     res = statfs(redirected.value, stbuf);
