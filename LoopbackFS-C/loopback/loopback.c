@@ -42,6 +42,11 @@
 #include <libproc.h>
 #include <sys/sysctl.h>
 
+struct path {
+    bool fail;
+    char value[PATH_MAX];
+};
+
 #if defined(_POSIX_C_SOURCE)
 typedef unsigned char  u_char;
 typedef unsigned short u_short;
@@ -326,26 +331,42 @@ struct wrapper_info {
 static struct wrapper_info find_wrapper_in_tree(pid_t starting_pid);
 
 // Helper function to apply wrapper detection and path redirection
-static const char* apply_wrapper_redirect_with_buffer(const char* path, const char* operation_name, char* result_buf, size_t buf_size) {
-    struct fuse_context *context = fuse_get_context();
+static struct path apply_wrapper_redirect_with_context(const char* original_path, const char* operation_name, struct fuse_context *context) {
+    struct path result = { .fail = false };
+
     if (context) {
+        // Check if this is fseventsd - return early to avoid conflicts
+        char proc_name[PROC_PIDPATHINFO_MAXSIZE];
+        if (proc_pidpath(context->pid, proc_name, sizeof(proc_name)) > 0) {
+            char *basename = strrchr(proc_name, '/');
+            basename = basename ? basename + 1 : proc_name;
+
+            if (strcmp(basename, "fseventsd") == 0) {
+                fprintf(stderr, "*** %s BLOCKING fseventsd PID %d ***\n", operation_name, context->pid);
+                result.fail = true;
+                return result;
+            }
+        }
+
         struct wrapper_info wrapper = find_wrapper_in_tree(context->pid);
         if (wrapper.found && strlen(wrapper.value) > 0) {
             // Wrapper detected - redirect to wrapper path
-            build_redirected_path(path, wrapper.value, result_buf, buf_size);
-            fprintf(stderr, "*** %s REDIRECT: %s -> %s ***\n", operation_name, path, result_buf);
-            return result_buf;
+            build_redirected_path(original_path, wrapper.value, result.value, sizeof(result.value));
+            fprintf(stderr, "*** %s REDIRECT: %s -> %s ***\n", operation_name, original_path, result.value);
+            return result;
         }
     }
 
     // No wrapper - pass through to backup location (original content)
     if (loopback.backup_created) {
-        build_redirected_path(path, loopback.backup_path, result_buf, buf_size);
-        fprintf(stderr, "*** %s PASSTHROUGH: %s -> %s ***\n", operation_name, path, result_buf);
-        return result_buf;
+        build_redirected_path(original_path, loopback.backup_path, result.value, sizeof(result.value));
+        fprintf(stderr, "*** %s PASSTHROUGH: %s -> %s ***\n", operation_name, original_path, result.value);
+        return result;
     }
 
-    return path;
+    strncpy(result.value, original_path, sizeof(result.value) - 1);
+    result.value[sizeof(result.value) - 1] = '\0';
+    return result;
 }
 
 // Function to find WRAPPER environment variable in process tree
@@ -357,46 +378,20 @@ static struct wrapper_info find_wrapper_in_tree(pid_t starting_pid) {
     fprintf(stderr, "Searching for WRAPPER in process tree starting from PID %d:\n", starting_pid);
 
     while (current_pid > 1 && depth < 10) {
-        char proc_name[PROC_PIDPATHINFO_MAXSIZE];
-        char *basename = "<unknown>";
-
-        // Get process name
-        if (proc_pidpath(current_pid, proc_name, sizeof(proc_name)) > 0) {
-            char *slash = strrchr(proc_name, '/');
-            if (slash) {
-                basename = slash + 1;
-            } else {
-                basename = proc_name;
-            }
-        }
-
         // Check if this process has WRAPPER in its environment variables
         char wrapper_value[256];
         bool found_wrapper = get_wrapper_from_env_process(current_pid, wrapper_value, sizeof(wrapper_value));
-        int has_wrapper = 0;
+
+        fprintf(stderr, "  PID %d: %s\n",
+                current_pid,
+                found_wrapper ? "HAS WRAPPER!" : "no wrapper");
 
         if (found_wrapper) {
-            has_wrapper = 1;
-            fprintf(stderr, "  Found WRAPPER=%s in %s process environment!\n", wrapper_value, basename);
-        } else {
-            // Also check if the process name contains "wrapper" (legacy check)
-            has_wrapper = (strstr(basename, "wrapper") != NULL);
-        }
-
-        fprintf(stderr, "  PID %d (%s): %s\n",
-                current_pid, basename,
-                has_wrapper ? "HAS WRAPPER!" : "no wrapper");
-
-        if (has_wrapper) {
             result.found = 1;
             result.pid = current_pid;
-            if (found_wrapper) {
-                strncpy(result.value, wrapper_value, sizeof(result.value) - 1);
-                result.value[sizeof(result.value) - 1] = '\0';
-                fprintf(stderr, "Found WRAPPER=%s at PID %d!\n", wrapper_value, current_pid);
-            } else {
-                fprintf(stderr, "Found WRAPPER process at PID %d!\n", current_pid);
-            }
+            strncpy(result.value, wrapper_value, sizeof(result.value) - 1);
+            result.value[sizeof(result.value) - 1] = '\0';
+            fprintf(stderr, "Found WRAPPER=%s at PID %d!\n", wrapper_value, current_pid);
             return result;
         }
 
@@ -457,11 +452,14 @@ static int
 loopback_getattr(const char *path, struct stat *stbuf)
 {
     int res;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "GETATTR", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "GETATTR", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
-    res = lstat(path, stbuf);
+    res = lstat(redirected.value, stbuf);
 
     /*
      * The optimal I/O size can be set on a per-file basis. Setting st_blksize
@@ -503,9 +501,12 @@ static int
 loopback_access(const char *path, int mask)
 {
     int res;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "ACCESS", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "ACCESS", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
     /*
      * Standard access permission flags:
@@ -531,7 +532,7 @@ loopback_access(const char *path, int mask)
      * _CHOWN_OK       change ownership
      */
 
-    res = access(path, mask & (F_OK | X_OK | W_OK | R_OK));
+    res = access(redirected.value, mask & (F_OK | X_OK | W_OK | R_OK));
     if (res == -1)
         return -errno;
 
@@ -544,11 +545,14 @@ static int
 loopback_readlink(const char *path, char *buf, size_t size)
 {
     int res;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "READLINK", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "READLINK", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
-    res = readlink(path, buf, size - 1);
+    res = readlink(redirected.value, buf, size - 1);
     if (res == -1) {
         return -errno;
     }
@@ -568,16 +572,19 @@ static int
 loopback_opendir(const char *path, struct fuse_file_info *fi)
 {
     int res;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "OPENDIR", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "OPENDIR", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
     struct loopback_dirp *d = malloc(sizeof(struct loopback_dirp));
     if (d == NULL) {
         return -ENOMEM;
     }
 
-    d->dp = opendir(path);
+    d->dp = opendir(redirected.value);
     if (d->dp == NULL) {
         res = -errno;
         free(d);
@@ -668,14 +675,16 @@ loopback_mknod(const char *path, mode_t mode, dev_t rdev)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    static char path_redirected[PATH_MAX];
+    struct path redirected = apply_wrapper_redirect_with_context(path, "MKNOD", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "MKNOD", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
     if (S_ISFIFO(mode)) {
-        res = mkfifo(path, mode);
+        res = mkfifo(redirected.value, mode);
     } else {
-        res = mknod(path, mode, rdev);
+        res = mknod(redirected.value, mode, rdev);
     }
 
     if (res == -1) {
@@ -683,8 +692,8 @@ loopback_mknod(const char *path, mode_t mode, dev_t rdev)
     }
 
     // Set proper ownership to the calling user
-    if (context && chown(path, context->uid, context->gid) == -1) {
-        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", path, strerror(errno));
+    if (context && chown(redirected.value, context->uid, context->gid) == -1) {
+        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", redirected.value, strerror(errno));
     }
 
     return 0;
@@ -695,18 +704,20 @@ loopback_mkdir(const char *path, mode_t mode)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    static char path_redirected[PATH_MAX];
+    struct path redirected = apply_wrapper_redirect_with_context(path, "MKDIR", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "MKDIR", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
-    res = mkdir(path, mode);
+    res = mkdir(redirected.value, mode);
     if (res == -1) {
         return -errno;
     }
 
     // Set proper ownership to the calling user
-    if (context && chown(path, context->uid, context->gid) == -1) {
-        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", path, strerror(errno));
+    if (context && chown(redirected.value, context->uid, context->gid) == -1) {
+        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", redirected.value, strerror(errno));
     }
 
     return 0;
@@ -716,11 +727,14 @@ static int
 loopback_unlink(const char *path)
 {
     int res;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "UNLINK", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "UNLINK", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
-    res = unlink(path);
+    res = unlink(redirected.value);
     if (res == -1) {
         return -errno;
     }
@@ -732,11 +746,14 @@ static int
 loopback_rmdir(const char *path)
 {
     int res;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "RMDIR", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "RMDIR", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
-    res = rmdir(path);
+    res = rmdir(redirected.value);
     if (res == -1) {
         return -errno;
     }
@@ -748,11 +765,14 @@ static int
 loopback_symlink(const char *from, const char *to)
 {
     int res;
-    static char to_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(to, "SYMLINK", context);
 
-    to = apply_wrapper_redirect_with_buffer(to, "SYMLINK", to_redirected, sizeof(to_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
-    res = symlink(from, to);
+    res = symlink(from, redirected.value);
     if (res == -1) {
         return -errno;
     }
@@ -764,13 +784,15 @@ static int
 loopback_rename(const char *from, const char *to)
 {
     int res;
-    static char from_redirected[PATH_MAX];
-    static char to_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected_from = apply_wrapper_redirect_with_context(from, "RENAME1", context);
+    struct path redirected_to = apply_wrapper_redirect_with_context(to, "RENAME2", context);
 
-    from = apply_wrapper_redirect_with_buffer(from, "RENAME1", from_redirected, sizeof(from_redirected));
-    to = apply_wrapper_redirect_with_buffer(to, "RENAME2", to_redirected, sizeof(to_redirected));
+    if (redirected_from.fail || redirected_to.fail) {
+        return -ENOTSUP;
+    }
 
-    res = rename(from, to);
+    res = rename(redirected_from.value, redirected_to.value);
     if (res == -1) {
         return -errno;
     }
@@ -784,13 +806,15 @@ static int
 loopback_exchange(const char *path1, const char *path2, unsigned long options)
 {
     int res;
-    static char path1_redirected[PATH_MAX];
-    static char path2_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected1 = apply_wrapper_redirect_with_context(path1, "EXCHANGE1", context);
+    struct path redirected2 = apply_wrapper_redirect_with_context(path2, "EXCHANGE2", context);
 
-    path1 = apply_wrapper_redirect_with_buffer(path1, "EXCHANGE1", path1_redirected, sizeof(path1_redirected));
-    path2 = apply_wrapper_redirect_with_buffer(path2, "EXCHANGE2", path2_redirected, sizeof(path2_redirected));
+    if (redirected1.fail || redirected2.fail) {
+        return -ENOTSUP;
+    }
 
-    res = exchangedata(path1, path2, options);
+    res = exchangedata(redirected1.value, redirected2.value, options);
     if (res == -1) {
         return -errno;
     }
@@ -939,12 +963,15 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
     int res;
     uid_t uid = -1;
     gid_t gid = -1;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "SETATTR_X", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "SETATTR_X", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
     if (SETATTR_WANTS_MODE(attr)) {
-        res = lchmod(path, attr->mode);
+        res = lchmod(redirected.value, attr->mode);
         if (res == -1) {
             return -errno;
         }
@@ -959,14 +986,14 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
     }
 
     if ((uid != -1) || (gid != -1)) {
-        res = lchown(path, uid, gid);
+        res = lchown(redirected.value, uid, gid);
         if (res == -1) {
             return -errno;
         }
     }
 
     if (SETATTR_WANTS_SIZE(attr)) {
-        res = truncate(path, attr->size);
+        res = truncate(redirected.value, attr->size);
         if (res == -1) {
             return -errno;
         }
@@ -982,7 +1009,7 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
         }
         tv[1].tv_sec = attr->modtime.tv_sec;
         tv[1].tv_usec = attr->modtime.tv_nsec / 1000;
-        res = lutimes(path, tv);
+        res = lutimes(redirected.value, tv);
         if (res == -1) {
             return -errno;
         }
@@ -999,7 +1026,7 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
         attributes.forkattr = 0;
         attributes.volattr = 0;
 
-        res = setattrlist(path, &attributes, &attr->crtime,
+        res = setattrlist(redirected.value, &attributes, &attr->crtime,
                           sizeof(struct timespec), FSOPT_NOFOLLOW);
 
         if (res == -1) {
@@ -1018,7 +1045,7 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
         attributes.forkattr = 0;
         attributes.volattr = 0;
 
-        res = setattrlist(path, &attributes, &attr->chgtime,
+        res = setattrlist(redirected.value, &attributes, &attr->chgtime,
                           sizeof(struct timespec), FSOPT_NOFOLLOW);
 
         if (res == -1) {
@@ -1037,7 +1064,7 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
         attributes.forkattr = 0;
         attributes.volattr = 0;
 
-        res = setattrlist(path, &attributes, &attr->bkuptime,
+        res = setattrlist(redirected.value, &attributes, &attr->bkuptime,
                           sizeof(struct timespec), FSOPT_NOFOLLOW);
 
         if (res == -1) {
@@ -1046,7 +1073,7 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
     }
 
     if (SETATTR_WANTS_FLAGS(attr)) {
-        res = lchflags(path, attr->flags);
+        res = lchflags(redirected.value, attr->flags);
         if (res == -1) {
             return -errno;
         }
@@ -1061,9 +1088,12 @@ loopback_getxtimes(const char *path, struct timespec *bkuptime,
 {
     int res = 0;
     struct attrlist attributes;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "GETXTIMES", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "GETXTIMES", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
     attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
     attributes.reserved    = 0;
@@ -1081,7 +1111,7 @@ loopback_getxtimes(const char *path, struct timespec *bkuptime,
     struct xtimeattrbuf buf;
 
     attributes.commonattr = ATTR_CMN_BKUPTIME;
-    res = getattrlist(path, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
+    res = getattrlist(redirected.value, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
     if (res == 0) {
         (void)memcpy(bkuptime, &(buf.xtime), sizeof(struct timespec));
     } else {
@@ -1089,7 +1119,7 @@ loopback_getxtimes(const char *path, struct timespec *bkuptime,
     }
 
     attributes.commonattr = ATTR_CMN_CRTIME;
-    res = getattrlist(path, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
+    res = getattrlist(redirected.value, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
     if (res == 0) {
         (void)memcpy(crtime, &(buf.xtime), sizeof(struct timespec));
     } else {
@@ -1104,18 +1134,20 @@ loopback_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     int fd;
     struct fuse_context *context = fuse_get_context();
-    static char path_redirected[PATH_MAX];
+    struct path redirected = apply_wrapper_redirect_with_context(path, "CREATE", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "CREATE", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
-    fd = open(path, fi->flags, mode);
+    fd = open(redirected.value, fi->flags, mode);
     if (fd == -1) {
         return -errno;
     }
 
     // Set proper ownership to the calling user
     if (context && fchown(fd, context->uid, context->gid) == -1) {
-        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", path, strerror(errno));
+        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", redirected.value, strerror(errno));
     }
 
     fi->fh = fd;
@@ -1126,11 +1158,14 @@ static int
 loopback_open(const char *path, struct fuse_file_info *fi)
 {
     int fd;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "OPEN", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "OPEN", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
-    fd = open(path, fi->flags);
+    fd = open(redirected.value, fi->flags);
     if (fd == -1) {
         return -errno;
     }
@@ -1217,18 +1252,21 @@ loopback_setxattr(const char *path, const char *name, const char *value,
                   size_t size, int flags, uint32_t position)
 {
     int res;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "SETXATTR", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "SETXATTR", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
     flags |= XATTR_NOFOLLOW;
     if (strncmp(name, "com.apple.", 10) == 0) {
         char new_name[MAXPATHLEN] = "org.apple.";
         strncpy(new_name + 10, name + 10, sizeof(new_name) - 10);
 
-        res = setxattr(path, new_name, value, size, position, flags);
+        res = setxattr(redirected.value, new_name, value, size, position, flags);
     } else {
-        res = setxattr(path, name, value, size, position, flags);
+        res = setxattr(redirected.value, name, value, size, position, flags);
     }
 
     if (res == -1) {
@@ -1243,17 +1281,20 @@ loopback_getxattr(const char *path, const char *name, char *value, size_t size,
                   uint32_t position)
 {
     int res;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "GETXATTR", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "GETXATTR", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
     if (strncmp(name, "com.apple.", 10) == 0) {
         char new_name[MAXPATHLEN] = "org.apple.";
         strncpy(new_name + 10, name + 10, sizeof(new_name) - 10);
 
-        res = getxattr(path, new_name, value, size, position, XATTR_NOFOLLOW);
+        res = getxattr(redirected.value, new_name, value, size, position, XATTR_NOFOLLOW);
     } else {
-        res = getxattr(path, name, value, size, position, XATTR_NOFOLLOW);
+        res = getxattr(redirected.value, name, value, size, position, XATTR_NOFOLLOW);
     }
 
     if (res == -1) {
@@ -1266,11 +1307,14 @@ loopback_getxattr(const char *path, const char *name, char *value, size_t size,
 static int
 loopback_listxattr(const char *path, char *list, size_t size)
 {
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "LISTXATTR", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "LISTXATTR", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
-    ssize_t res = listxattr(path, list, size, XATTR_NOFOLLOW);
+    ssize_t res = listxattr(redirected.value, list, size, XATTR_NOFOLLOW);
     if (res > 0) {
         if (list) {
             size_t len = 0;
@@ -1287,7 +1331,7 @@ loopback_listxattr(const char *path, char *list, size_t size)
             } while (len < res);
         } else {
             /*
-            ssize_t res2 = getxattr(path, G_KAUTH_FILESEC_XATTR, NULL, 0, 0,
+            ssize_t res2 = getxattr(redirected.value, G_KAUTH_FILESEC_XATTR, NULL, 0, 0,
                                     XATTR_NOFOLLOW);
             if (res2 >= 0) {
                 res -= sizeof(G_KAUTH_FILESEC_XATTR);
@@ -1307,17 +1351,20 @@ static int
 loopback_removexattr(const char *path, const char *name)
 {
     int res;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "REMOVEXATTR", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "REMOVEXATTR", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
     if (strncmp(name, "com.apple.", 10) == 0) {
         char new_name[MAXPATHLEN] = "org.apple.";
         strncpy(new_name + 10, name + 10, sizeof(new_name) - 10);
 
-        res = removexattr(path, new_name, XATTR_NOFOLLOW);
+        res = removexattr(redirected.value, new_name, XATTR_NOFOLLOW);
     } else {
-        res = removexattr(path, name, XATTR_NOFOLLOW);
+        res = removexattr(redirected.value, name, XATTR_NOFOLLOW);
     }
 
     if (res == -1) {
@@ -1371,11 +1418,14 @@ static int
 loopback_statfs_x(const char *path, struct statfs *stbuf)
 {
     int res;
-    static char path_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected = apply_wrapper_redirect_with_context(path, "STATFS", context);
 
-    path = apply_wrapper_redirect_with_buffer(path, "STATFS", path_redirected, sizeof(path_redirected));
+    if (redirected.fail) {
+        return -ENOTSUP;
+    }
 
-    res = statfs(path, stbuf);
+    res = statfs(redirected.value, stbuf);
     if (res == -1) {
         return -errno;
     }
@@ -1394,13 +1444,15 @@ static int
 loopback_renamex(const char *path1, const char *path2, unsigned int flags)
 {
     int res;
-    static char path1_redirected[PATH_MAX];
-    static char path2_redirected[PATH_MAX];
+    struct fuse_context *context = fuse_get_context();
+    struct path redirected_path1 = apply_wrapper_redirect_with_context(path1, "RENAMEX1", context);
+    struct path redirected_path2 = apply_wrapper_redirect_with_context(path2, "RENAMEX2", context);
 
-    path1 = apply_wrapper_redirect_with_buffer(path1, "RENAMEX1", path1_redirected, sizeof(path1_redirected));
-    path2 = apply_wrapper_redirect_with_buffer(path2, "RENAMEX2", path2_redirected, sizeof(path2_redirected));
+    if (redirected_path1.fail || redirected_path2.fail) {
+        return -ENOTSUP;
+    }
 
-    res = renamex_np(path1, path2, flags);
+    res = renamex_np(redirected_path1.value, redirected_path2.value, flags);
     if (res == -1) {
         return -errno;
     }
