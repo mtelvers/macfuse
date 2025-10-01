@@ -48,6 +48,22 @@ struct path {
     char value[PATH_MAX];
 };
 
+// File location enumeration for overlay filesystem
+typedef enum {
+    OVERLAY_UPPER,      // File exists in upper layer
+    OVERLAY_LOWER,      // File exists in lower layer
+    OVERLAY_WHITEOUT,   // File is marked as deleted
+    OVERLAY_NONE        // File doesn't exist anywhere
+} overlay_location_t;
+
+// Structure to hold overlay detection results
+struct overlay_info {
+    int found;
+    pid_t pid;
+    char upper_dir[256];
+    char lower_dir[256];
+};
+
 #if defined(_POSIX_C_SOURCE)
 typedef unsigned char  u_char;
 typedef unsigned short u_short;
@@ -383,22 +399,6 @@ static overlay_location_t find_overlay_file_location(const char* original_path, 
     return OVERLAY_NONE;
 }
 
-// File location enumeration for overlay filesystem
-typedef enum {
-    OVERLAY_UPPER,      // File exists in upper layer
-    OVERLAY_LOWER,      // File exists in lower layer
-    OVERLAY_WHITEOUT,   // File is marked as deleted
-    OVERLAY_NONE        // File doesn't exist anywhere
-} overlay_location_t;
-
-// Structure to hold overlay detection results
-struct overlay_info {
-    int found;
-    pid_t pid;
-    char upper_dir[256];
-    char lower_dir[256];
-};
-
 // Forward declaration
 static struct overlay_info find_overlay_in_tree(pid_t starting_pid);
 
@@ -664,11 +664,159 @@ struct loopback_dirp {
     off_t offset;
 };
 
+// Overlay directory structure for merged directory listing
+struct overlay_dirp {
+    bool is_overlay;                    // True if this is an overlay directory
+    char **merged_entries;              // Array of merged filenames
+    int entry_count;                    // Number of entries
+    int current_index;                  // Current position for iteration
+    struct overlay_info overlay_info;   // Store overlay info for this directory
+    char original_path[PATH_MAX];       // Original requested path
+};
+
+// Function to merge directory entries from upper and lower layers
+static int merge_overlay_directory_entries(const char* original_path, const struct overlay_info* overlay,
+                                           char*** entries, int* entry_count) {
+    struct path upper_path_struct = build_redirected_path(original_path, overlay->upper_dir);
+    struct path lower_path_struct = build_redirected_path(original_path, overlay->lower_dir);
+
+    // Whiteout directory path
+    char whiteout_path[PATH_MAX];
+    if (strcmp(original_path, "/") == 0) {
+        snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted", overlay->upper_dir);
+    } else {
+        snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted%s", overlay->upper_dir, original_path);
+    }
+
+    fprintf(stderr, "    Merging directory entries for %s:\n", original_path);
+    fprintf(stderr, "      Upper dir: %s\n", upper_path_struct.value);
+    fprintf(stderr, "      Lower dir: %s\n", lower_path_struct.value);
+    fprintf(stderr, "      Whiteout dir: %s\n", whiteout_path);
+
+    // Simple implementation: allocate array for up to 1000 entries
+    *entries = malloc(1000 * sizeof(char*));
+    if (!*entries) {
+        return -ENOMEM;
+    }
+
+    *entry_count = 0;
+
+    // Track which files we've seen to avoid duplicates (upper takes precedence)
+    char seen_files[1000][256];  // Simple fixed-size array for tracking
+    int seen_count = 0;
+
+    // Read whiteout directory to get list of deleted files
+    char whiteout_files[1000][256];
+    int whiteout_count = 0;
+    DIR* whiteout_dp = opendir(whiteout_path);
+    if (whiteout_dp) {
+        struct dirent* entry;
+        while ((entry = readdir(whiteout_dp)) && whiteout_count < 1000) {
+            if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+                strncpy(whiteout_files[whiteout_count], entry->d_name, sizeof(whiteout_files[0]) - 1);
+                whiteout_files[whiteout_count][sizeof(whiteout_files[0]) - 1] = '\0';
+                whiteout_count++;
+            }
+        }
+        closedir(whiteout_dp);
+    }
+
+
+    // First, read upper directory
+    DIR* upper_dp = opendir(upper_path_struct.value);
+    if (upper_dp) {
+        struct dirent* entry;
+        while ((entry = readdir(upper_dp)) && *entry_count < 1000) {
+            if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+                // Skip .deleted directory itself
+                if (strcmp(entry->d_name, ".deleted") == 0) {
+                    continue;
+                }
+
+                (*entries)[*entry_count] = strdup(entry->d_name);
+                strncpy(seen_files[seen_count], entry->d_name, sizeof(seen_files[0]) - 1);
+                seen_files[seen_count][sizeof(seen_files[0]) - 1] = '\0';
+                seen_count++;
+                (*entry_count)++;
+                fprintf(stderr, "        Added from upper: %s\n", entry->d_name);
+            }
+        }
+        closedir(upper_dp);
+    }
+
+    // Then, read lower directory (only add files not in upper and not whiteout)
+    DIR* lower_dp = opendir(lower_path_struct.value);
+    if (lower_dp) {
+        struct dirent* entry;
+        while ((entry = readdir(lower_dp)) && *entry_count < 1000) {
+            if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+                // Check if already seen (upper takes precedence)
+                bool found_in_upper = false;
+                for (int i = 0; i < seen_count; i++) {
+                    if (strcmp(seen_files[i], entry->d_name) == 0) {
+                        found_in_upper = true;
+                        break;
+                    }
+                }
+
+                // Check if whiteout (deleted)
+                bool is_whiteout = false;
+                for (int i = 0; i < whiteout_count; i++) {
+                    if (strcmp(whiteout_files[i], entry->d_name) == 0) {
+                        is_whiteout = true;
+                        break;
+                    }
+                }
+
+                if (!found_in_upper && !is_whiteout) {
+                    (*entries)[*entry_count] = strdup(entry->d_name);
+                    (*entry_count)++;
+                    fprintf(stderr, "        Added from lower: %s\n", entry->d_name);
+                }
+            }
+        }
+        closedir(lower_dp);
+    }
+
+    fprintf(stderr, "      Total merged entries: %d\n", *entry_count);
+    return 0;
+}
+
 static int
 loopback_opendir(const char *path, struct fuse_file_info *fi)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
+
+    if (context) {
+        // Check for overlay configuration
+        struct overlay_info overlay = find_overlay_in_tree(context->pid);
+        if (overlay.found && strlen(overlay.upper_dir) > 0) {
+            // This is an overlay directory - use merged directory listing
+            struct overlay_dirp *od = malloc(sizeof(struct overlay_dirp));
+            if (od == NULL) {
+                return -ENOMEM;
+            }
+
+            od->is_overlay = true;
+            od->overlay_info = overlay;
+            od->current_index = 0;
+            strncpy(od->original_path, path, sizeof(od->original_path) - 1);
+            od->original_path[sizeof(od->original_path) - 1] = '\0';
+
+            // Merge directory entries from upper and lower layers
+            res = merge_overlay_directory_entries(path, &overlay, &od->merged_entries, &od->entry_count);
+            if (res < 0) {
+                free(od);
+                return res;
+            }
+
+            fi->fh = (unsigned long)od;
+            return 0;
+        }
+    }
+
+    // Fall back to regular directory handling
     struct path redirected = apply_wrapper_redirect_with_context(path, "OPENDIR", context);
 
     if (redirected.fail) {
@@ -705,63 +853,143 @@ static int
 loopback_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                  off_t offset, struct fuse_file_info *fi)
 {
-    struct loopback_dirp *d = get_dirp(fi);
+    // Check if this is an overlay directory by examining the first field
+    // overlay_dirp starts with is_overlay = true (1), loopback_dirp starts with DIR* pointer
+    struct overlay_dirp *od = (struct overlay_dirp *)(uintptr_t)fi->fh;
 
-    (void)path;
+    // Simple heuristic: if first byte is 1, it's likely an overlay_dirp
+    if (od && od->is_overlay) {
+        // Handle overlay directory - merged listing
+        fprintf(stderr, "    Reading overlay directory: %s (offset=%lld, entries=%d)\n",
+                od->original_path, (long long)offset, od->entry_count);
 
-    if (offset == 0) {
-        rewinddir(d->dp);
-        d->entry = NULL;
-        d->offset = 0;
-    } else if (offset != d->offset) {
-        // Subtract the one that we add when calling telldir() below
-        seekdir(d->dp, offset - 1);
-        d->entry = NULL;
-        d->offset = offset;
-    }
+        // Add . and .. entries first
+        if (offset == 0) {
+            struct stat st;
+            memset(&st, 0, sizeof(st));
+            st.st_mode = S_IFDIR;
+            if (filler(buf, ".", &st, 1)) {
+                return 0;
+            }
+        }
+        if (offset <= 1) {
+            struct stat st;
+            memset(&st, 0, sizeof(st));
+            st.st_mode = S_IFDIR;
+            if (filler(buf, "..", &st, 2)) {
+                return 0;
+            }
+        }
 
-    while (1) {
-        struct stat st;
-        off_t nextoff;
+        // Add merged entries starting from offset-2 (accounting for . and ..)
+        int start_index = (offset <= 2) ? 0 : (offset - 2);
+        for (int i = start_index; i < od->entry_count; i++) {
+            struct stat st;
+            memset(&st, 0, sizeof(st));
+            st.st_mode = S_IFREG;  // Default to regular file
 
-        if (!d->entry) {
-            d->entry = readdir(d->dp);
-            if (!d->entry) {
+            // Try to get real stat info by constructing full path
+            char full_path[PATH_MAX];
+            if (strcmp(od->original_path, "/") == 0) {
+                snprintf(full_path, sizeof(full_path), "/%s", od->merged_entries[i]);
+            } else {
+                snprintf(full_path, sizeof(full_path), "%s/%s", od->original_path, od->merged_entries[i]);
+            }
+
+            // Use our overlay logic to find the file and get its stats
+            struct fuse_context *context = fuse_get_context();
+            struct path redirected = apply_wrapper_redirect_with_context(full_path, "READDIR_STAT", context);
+            if (!redirected.fail) {
+                lstat(redirected.value, &st);
+            }
+
+            off_t nextoff = i + 3;  // +3 for ., .., and 0-based index
+            if (filler(buf, od->merged_entries[i], &st, nextoff)) {
                 break;
             }
         }
 
-        memset(&st, 0, sizeof(st));
-        st.st_ino = d->entry->d_ino;
-        st.st_mode = d->entry->d_type << 12;
+        return 0;
+    } else {
+        // Handle regular directory - use existing logic
+        struct loopback_dirp *d = get_dirp(fi);
 
-        /*
-         * Under macOS, telldir() may return 0 the first time it is called.
-         * But for libfuse, an offset of zero means that offsets are not
-         * supported, so we shift everything by one.
-         */
-        nextoff = telldir(d->dp) + 1;
+        (void)path;
 
-        if (filler(buf, d->entry->d_name, &st, nextoff)) {
-            break;
+        if (offset == 0) {
+            rewinddir(d->dp);
+            d->entry = NULL;
+            d->offset = 0;
+        } else if (offset != d->offset) {
+            // Subtract the one that we add when calling telldir() below
+            seekdir(d->dp, offset - 1);
+            d->entry = NULL;
+            d->offset = offset;
         }
 
-        d->entry = NULL;
-        d->offset = nextoff;
-    }
+        while (1) {
+            struct stat st;
+            off_t nextoff;
 
-    return 0;
+            if (!d->entry) {
+                d->entry = readdir(d->dp);
+                if (!d->entry) {
+                    break;
+                }
+            }
+
+            memset(&st, 0, sizeof(st));
+            st.st_ino = d->entry->d_ino;
+            st.st_mode = d->entry->d_type << 12;
+
+            /*
+             * Under macOS, telldir() may return 0 the first time it is called.
+             * But for libfuse, an offset of zero means that offsets are not
+             * supported, so we shift everything by one.
+             */
+            nextoff = telldir(d->dp) + 1;
+
+            if (filler(buf, d->entry->d_name, &st, nextoff)) {
+                break;
+            }
+
+            d->entry = NULL;
+            d->offset = nextoff;
+        }
+
+        return 0;
+    }
 }
 
 static int
 loopback_releasedir(const char *path, struct fuse_file_info *fi)
 {
-    struct loopback_dirp *d = get_dirp(fi);
+    // Check if this is an overlay directory
+    struct overlay_dirp *od = (struct overlay_dirp *)(uintptr_t)fi->fh;
 
     (void)path;
 
-    closedir(d->dp);
-    free(d);
+    if (od && od->is_overlay) {
+        // Handle overlay directory cleanup
+        fprintf(stderr, "    Releasing overlay directory: %s (%d entries)\n",
+                od->original_path, od->entry_count);
+
+        // Free all the allocated entry names
+        for (int i = 0; i < od->entry_count; i++) {
+            free(od->merged_entries[i]);
+        }
+
+        // Free the entries array
+        free(od->merged_entries);
+
+        // Free the overlay directory structure
+        free(od);
+    } else {
+        // Handle regular directory cleanup
+        struct loopback_dirp *d = get_dirp(fi);
+        closedir(d->dp);
+        free(d);
+    }
 
     return 0;
 }
