@@ -369,33 +369,43 @@ static overlay_location_t find_overlay_file_location(const char* original_path, 
     fprintf(stderr, "      Whiteout: %s\n", whiteout_path);
 
     // 1. Check if file is whiteout (deleted)
-    if (lstat(whiteout_path, &st) == 0) {
+    // Important: whiteout markers are regular files, not directories
+    // The .deleted directory structure itself is not a whiteout
+    if (lstat(whiteout_path, &st) == 0 && S_ISREG(st.st_mode)) {
         fprintf(stderr, "      -> WHITEOUT (file deleted)\n");
-        strncpy(result_path, whiteout_path, result_size - 1);
-        result_path[result_size - 1] = '\0';
+        if (result_path && result_size > 0) {
+            strncpy(result_path, whiteout_path, result_size - 1);
+            result_path[result_size - 1] = '\0';
+        }
         return OVERLAY_WHITEOUT;
     }
 
     // 2. Check upper layer first
     if (lstat(upper_path_struct.value, &st) == 0) {
         fprintf(stderr, "      -> UPPER (found in upper layer)\n");
-        strncpy(result_path, upper_path_struct.value, result_size - 1);
-        result_path[result_size - 1] = '\0';
+        if (result_path && result_size > 0) {
+            strncpy(result_path, upper_path_struct.value, result_size - 1);
+            result_path[result_size - 1] = '\0';
+        }
         return OVERLAY_UPPER;
     }
 
     // 3. Check lower layer
     if (lstat(lower_path_struct.value, &st) == 0) {
         fprintf(stderr, "      -> LOWER (found in lower layer)\n");
-        strncpy(result_path, lower_path_struct.value, result_size - 1);
-        result_path[result_size - 1] = '\0';
+        if (result_path && result_size > 0) {
+            strncpy(result_path, lower_path_struct.value, result_size - 1);
+            result_path[result_size - 1] = '\0';
+        }
         return OVERLAY_LOWER;
     }
 
     // 4. File doesn't exist anywhere
     fprintf(stderr, "      -> NONE (file not found)\n");
-    strncpy(result_path, upper_path_struct.value, result_size - 1);  // Default to upper for new files
-    result_path[result_size - 1] = '\0';
+    if (result_path && result_size > 0) {
+        strncpy(result_path, upper_path_struct.value, result_size - 1);  // Default to upper for new files
+        result_path[result_size - 1] = '\0';
+    }
     return OVERLAY_NONE;
 }
 
@@ -706,6 +716,8 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     int seen_count = 0;
 
     // Read whiteout directory to get list of deleted files
+    // Important: only regular files in .deleted are whiteout markers
+    // Directories in .deleted are just structure to hold nested whiteout markers
     char whiteout_files[1000][256];
     int whiteout_count = 0;
     DIR* whiteout_dp = opendir(whiteout_path);
@@ -713,9 +725,17 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
         struct dirent* entry;
         while ((entry = readdir(whiteout_dp)) && whiteout_count < 1000) {
             if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
-                strncpy(whiteout_files[whiteout_count], entry->d_name, sizeof(whiteout_files[0]) - 1);
-                whiteout_files[whiteout_count][sizeof(whiteout_files[0]) - 1] = '\0';
-                whiteout_count++;
+                // Check if this is a regular file (whiteout marker) or directory (structure)
+                char full_whiteout_path[PATH_MAX];
+                snprintf(full_whiteout_path, sizeof(full_whiteout_path), "%s/%s", whiteout_path, entry->d_name);
+
+                struct stat whiteout_st;
+                if (lstat(full_whiteout_path, &whiteout_st) == 0 && S_ISREG(whiteout_st.st_mode)) {
+                    // Only add regular files as whiteout markers
+                    strncpy(whiteout_files[whiteout_count], entry->d_name, sizeof(whiteout_files[0]) - 1);
+                    whiteout_files[whiteout_count][sizeof(whiteout_files[0]) - 1] = '\0';
+                    whiteout_count++;
+                }
             }
         }
         closedir(whiteout_dp);
@@ -779,6 +799,132 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     }
 
     fprintf(stderr, "      Total merged entries: %d\n", *entry_count);
+    return 0;
+}
+
+// Helper function to recursively remove a directory and all its contents
+static int remove_directory_recursive(const char* path) {
+    DIR *dir = opendir(path);
+    if (!dir) {
+        return -1;
+    }
+
+    struct dirent *entry;
+    int failed = 0;
+
+    while ((entry = readdir(dir)) != NULL) {
+        if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+            continue;
+        }
+
+        char entry_path[PATH_MAX];
+        snprintf(entry_path, sizeof(entry_path), "%s/%s", path, entry->d_name);
+
+        struct stat st;
+        if (lstat(entry_path, &st) == 0) {
+            if (S_ISDIR(st.st_mode)) {
+                // Recursively remove subdirectory
+                if (remove_directory_recursive(entry_path) != 0) {
+                    failed = 1;
+                }
+            } else {
+                // Remove file
+                if (unlink(entry_path) != 0) {
+                    fprintf(stderr, "Failed to unlink %s: %s\n", entry_path, strerror(errno));
+                    failed = 1;
+                }
+            }
+        }
+    }
+
+    closedir(dir);
+
+    // Remove the directory itself
+    if (rmdir(path) != 0) {
+        fprintf(stderr, "Failed to rmdir %s: %s\n", path, strerror(errno));
+        failed = 1;
+    }
+
+    return failed ? -1 : 0;
+}
+
+// Helper function to create whiteout marker for overlay deletes
+static int create_whiteout_marker(const char* original_path, const struct overlay_info* overlay) {
+    char whiteout_dir[PATH_MAX];
+    char whiteout_file[PATH_MAX];
+    char *dir_path, *file_name;
+
+    // Build whiteout directory path
+    if (strcmp(original_path, "/") == 0) {
+        return -EINVAL;  // Can't delete root
+    }
+
+    // Extract directory and filename
+    char path_copy[PATH_MAX];
+    strncpy(path_copy, original_path, sizeof(path_copy) - 1);
+    path_copy[sizeof(path_copy) - 1] = '\0';
+
+    file_name = strrchr(path_copy, '/');
+    if (!file_name) {
+        return -EINVAL;
+    }
+
+    *file_name = '\0';  // Split the path
+    file_name++;        // Move past the '/'
+    dir_path = path_copy;
+
+    if (strlen(dir_path) == 0) {
+        dir_path = "/";
+    }
+
+    // Build whiteout directory: upper_dir/.deleted/dir_path
+    if (strcmp(dir_path, "/") == 0) {
+        snprintf(whiteout_dir, sizeof(whiteout_dir), "%s/.deleted", overlay->upper_dir);
+    } else {
+        snprintf(whiteout_dir, sizeof(whiteout_dir), "%s/.deleted%s", overlay->upper_dir, dir_path);
+    }
+
+    // Build whiteout file path
+    snprintf(whiteout_file, sizeof(whiteout_file), "%s/%s", whiteout_dir, file_name);
+
+    fprintf(stderr, "    Creating whiteout marker: %s\n", whiteout_file);
+
+    // Create whiteout directory if it doesn't exist (mkdir -p equivalent)
+    char temp_dir[PATH_MAX];
+    strncpy(temp_dir, whiteout_dir, sizeof(temp_dir) - 1);
+    temp_dir[sizeof(temp_dir) - 1] = '\0';
+
+    // Simple mkdir -p implementation
+    for (char *p = temp_dir + 1; *p; p++) {
+        if (*p == '/') {
+            *p = '\0';
+            mkdir(temp_dir, 0755);  // Ignore errors - directory might exist
+            *p = '/';
+        }
+    }
+    mkdir(temp_dir, 0755);  // Create final directory
+
+    // Check if whiteout_file already exists as a directory
+    // This happens when we previously deleted files within this directory
+    // Now we're deleting the directory itself, so we need to replace
+    // the directory (containing child whiteout markers) with a single file marker
+    struct stat st;
+    if (lstat(whiteout_file, &st) == 0 && S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "    Whiteout path exists as directory, removing recursively: %s\n", whiteout_file);
+        if (remove_directory_recursive(whiteout_file) != 0) {
+            fprintf(stderr, "    Warning: Failed to fully remove whiteout directory: %s\n", whiteout_file);
+            // Continue anyway - try to create the file marker
+        }
+    }
+
+    // Create whiteout marker file (empty file)
+    // If a file already exists here, creat() will truncate it (which is fine - same effect)
+    int fd = creat(whiteout_file, 0644);
+    if (fd < 0) {
+        return -errno;
+    }
+    close(fd);
+
     return 0;
 }
 
@@ -1052,6 +1198,50 @@ loopback_unlink(const char *path)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
+
+    if (context) {
+        // Check for overlay configuration
+        struct overlay_info overlay = find_overlay_in_tree(context->pid);
+        if (overlay.found && strlen(overlay.upper_dir) > 0) {
+            // This is an overlay filesystem - use overlay delete logic
+            overlay_location_t location = find_overlay_file_location(path, &overlay, NULL, 0);
+
+            switch (location) {
+                case OVERLAY_WHITEOUT:
+                    // File already deleted (whiteout exists)
+                    fprintf(stderr, "*** UNLINK OVERLAY: %s already whiteout (deleted) ***\n", path);
+                    return -ENOENT;
+
+                case OVERLAY_UPPER:
+                    // File exists in upper layer - delete it normally
+                    {
+                        struct path upper_path = build_redirected_path(path, overlay.upper_dir);
+                        fprintf(stderr, "*** UNLINK OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path.value);
+                        res = unlink(upper_path.value);
+                        if (res == -1) {
+                            return -errno;
+                        }
+                        return 0;
+                    }
+
+                case OVERLAY_LOWER:
+                    // File exists only in lower layer - create whiteout marker
+                    fprintf(stderr, "*** UNLINK OVERLAY LOWER: %s -> create whiteout ***\n", path);
+                    res = create_whiteout_marker(path, &overlay);
+                    if (res < 0) {
+                        return res;
+                    }
+                    return 0;
+
+                case OVERLAY_NONE:
+                    // File doesn't exist anywhere
+                    fprintf(stderr, "*** UNLINK OVERLAY NONE: %s does not exist ***\n", path);
+                    return -ENOENT;
+            }
+        }
+    }
+
+    // Fall back to regular unlink
     struct path redirected = apply_wrapper_redirect_with_context(path, "UNLINK", context);
 
     if (redirected.fail) {
@@ -1071,6 +1261,50 @@ loopback_rmdir(const char *path)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
+
+    if (context) {
+        // Check for overlay configuration
+        struct overlay_info overlay = find_overlay_in_tree(context->pid);
+        if (overlay.found && strlen(overlay.upper_dir) > 0) {
+            // This is an overlay filesystem - use overlay delete logic
+            overlay_location_t location = find_overlay_file_location(path, &overlay, NULL, 0);
+
+            switch (location) {
+                case OVERLAY_WHITEOUT:
+                    // Directory already deleted (whiteout exists)
+                    fprintf(stderr, "*** RMDIR OVERLAY: %s already whiteout (deleted) ***\n", path);
+                    return -ENOENT;
+
+                case OVERLAY_UPPER:
+                    // Directory exists in upper layer - delete it normally
+                    {
+                        struct path upper_path = build_redirected_path(path, overlay.upper_dir);
+                        fprintf(stderr, "*** RMDIR OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path.value);
+                        res = rmdir(upper_path.value);
+                        if (res == -1) {
+                            return -errno;
+                        }
+                        return 0;
+                    }
+
+                case OVERLAY_LOWER:
+                    // Directory exists only in lower layer - create whiteout marker
+                    fprintf(stderr, "*** RMDIR OVERLAY LOWER: %s -> create whiteout ***\n", path);
+                    res = create_whiteout_marker(path, &overlay);
+                    if (res < 0) {
+                        return res;
+                    }
+                    return 0;
+
+                case OVERLAY_NONE:
+                    // Directory doesn't exist anywhere
+                    fprintf(stderr, "*** RMDIR OVERLAY NONE: %s does not exist ***\n", path);
+                    return -ENOENT;
+            }
+        }
+    }
+
+    // Fall back to regular rmdir
     struct path redirected = apply_wrapper_redirect_with_context(path, "RMDIR", context);
 
     if (redirected.fail) {
