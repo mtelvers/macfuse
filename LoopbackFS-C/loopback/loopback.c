@@ -1687,6 +1687,93 @@ loopback_getxtimes(const char *path, struct timespec *bkuptime,
     return 0;
 }
 
+// Helper function to copy a file from lower layer to upper layer (copy-on-write)
+static int copy_file_to_upper(const char* lower_path, const char* upper_path, struct fuse_context *context) {
+    fprintf(stderr, "    Copy-on-write: copying %s -> %s\n", lower_path, upper_path);
+
+    // Open source file (lower layer)
+    int src_fd = open(lower_path, O_RDONLY);
+    if (src_fd < 0) {
+        fprintf(stderr, "    Failed to open source file: %s\n", strerror(errno));
+        return -errno;
+    }
+
+    // Get source file metadata
+    struct stat st;
+    if (fstat(src_fd, &st) < 0) {
+        close(src_fd);
+        return -errno;
+    }
+
+    // Create parent directories in upper layer if needed
+    char upper_dir[PATH_MAX];
+    strncpy(upper_dir, upper_path, sizeof(upper_dir) - 1);
+    upper_dir[sizeof(upper_dir) - 1] = '\0';
+    char *last_slash = strrchr(upper_dir, '/');
+    if (last_slash && last_slash != upper_dir) {
+        *last_slash = '\0';
+
+        // mkdir -p implementation
+        for (char *p = upper_dir + 1; *p; p++) {
+            if (*p == '/') {
+                *p = '\0';
+                mkdir(upper_dir, 0755);
+                *p = '/';
+            }
+        }
+        mkdir(upper_dir, 0755);
+    }
+
+    // Create destination file (upper layer)
+    int dst_fd = open(upper_path, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode);
+    if (dst_fd < 0) {
+        fprintf(stderr, "    Failed to create destination file: %s\n", strerror(errno));
+        close(src_fd);
+        return -errno;
+    }
+
+    // Copy data
+    char buffer[65536];
+    ssize_t bytes_read, bytes_written;
+    while ((bytes_read = read(src_fd, buffer, sizeof(buffer))) > 0) {
+        bytes_written = write(dst_fd, buffer, bytes_read);
+        if (bytes_written != bytes_read) {
+            fprintf(stderr, "    Copy failed during write: %s\n", strerror(errno));
+            close(src_fd);
+            close(dst_fd);
+            unlink(upper_path);  // Clean up partial copy
+            return -EIO;
+        }
+    }
+
+    if (bytes_read < 0) {
+        fprintf(stderr, "    Copy failed during read: %s\n", strerror(errno));
+        close(src_fd);
+        close(dst_fd);
+        unlink(upper_path);
+        return -errno;
+    }
+
+    // Set ownership to calling user
+    if (context && fchown(dst_fd, context->uid, context->gid) == -1) {
+        fprintf(stderr, "    Warning: Failed to set ownership: %s\n", strerror(errno));
+    }
+
+    // Preserve timestamps
+    struct timeval times[2];
+    times[0].tv_sec = st.st_atimespec.tv_sec;
+    times[0].tv_usec = st.st_atimespec.tv_nsec / 1000;
+    times[1].tv_sec = st.st_mtimespec.tv_sec;
+    times[1].tv_usec = st.st_mtimespec.tv_nsec / 1000;
+    futimes(dst_fd, times);
+
+    close(src_fd);
+    close(dst_fd);
+
+    fprintf(stderr, "    Copy-on-write completed successfully\n");
+    return 0;
+}
+
 static int
 loopback_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
@@ -1717,6 +1804,57 @@ loopback_open(const char *path, struct fuse_file_info *fi)
 {
     int fd;
     struct fuse_context *context = fuse_get_context();
+
+    // Check if this is an overlay filesystem and if we're opening for write
+    if (context) {
+        struct overlay_info overlay = find_overlay_in_tree(context->pid);
+        if (overlay.found && strlen(overlay.upper_dir) > 0) {
+            // Check if file needs write access
+            bool needs_write = (fi->flags & (O_WRONLY | O_RDWR | O_APPEND | O_TRUNC)) != 0;
+
+            if (needs_write) {
+                // Find where the file currently exists
+                char result_path[PATH_MAX];
+                overlay_location_t location = find_overlay_file_location(path, &overlay, result_path, sizeof(result_path));
+
+                if (location == OVERLAY_LOWER) {
+                    // File exists only in lower layer and we're opening for write
+                    // Need to copy it to upper layer first (copy-on-write)
+                    struct path upper_path = build_redirected_path(path, overlay.upper_dir);
+                    fprintf(stderr, "*** OPEN COPY-ON-WRITE: %s in lower, copying to upper %s ***\n",
+                            path, upper_path.value);
+
+                    int res = copy_file_to_upper(result_path, upper_path.value, context);
+                    if (res < 0) {
+                        return res;
+                    }
+
+                    // Now open the upper layer copy
+                    fd = open(upper_path.value, fi->flags);
+                    if (fd == -1) {
+                        return -errno;
+                    }
+
+                    fi->fh = fd;
+                    return 0;
+                } else if (location == OVERLAY_WHITEOUT) {
+                    // File is deleted
+                    return -ENOENT;
+                } else if (location == OVERLAY_UPPER || location == OVERLAY_NONE) {
+                    // File in upper or doesn't exist - use normal path resolution
+                    fd = open(result_path, fi->flags);
+                    if (fd == -1) {
+                        return -errno;
+                    }
+
+                    fi->fh = fd;
+                    return 0;
+                }
+            }
+        }
+    }
+
+    // Fall back to regular open logic (no overlay or read-only access)
     struct path redirected = apply_wrapper_redirect_with_context(path, "OPEN", context);
 
     if (redirected.fail) {
