@@ -652,6 +652,35 @@ loopback_readlink(const char *path, char *buf, size_t size)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
+
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** READLINK OVERLAY: %s ***\n", path);
+
+        // Find the symlink location in overlay
+        char result_path[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, result_path, sizeof(result_path));
+
+        if (location == OVERLAY_WHITEOUT) {
+            fprintf(stderr, "    -> Symlink is whiteout (deleted)\n");
+            return -ENOENT;
+        } else if (location == OVERLAY_UPPER || location == OVERLAY_LOWER) {
+            fprintf(stderr, "    -> Reading symlink from %s: %s\n",
+                    location == OVERLAY_UPPER ? "UPPER" : "LOWER", result_path);
+            res = readlink(result_path, buf, size - 1);
+            if (res == -1) {
+                return -errno;
+            }
+            buf[res] = '\0';
+            return 0;
+        } else {
+            fprintf(stderr, "    -> Symlink not found\n");
+            return -ENOENT;
+        }
+    }
+
+    // Non-overlay path: use standard redirection
     struct path redirected = apply_wrapper_redirect_with_context(path, "READLINK", context);
 
     if (redirected.fail) {
@@ -1324,6 +1353,60 @@ loopback_symlink(const char *from, const char *to)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
+
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** SYMLINK OVERLAY: %s -> %s ***\n", to, from);
+
+        // Symlinks are always created in upper layer (write operation)
+        struct path upper_path = build_redirected_path(to, overlay.upper_dir);
+        if (upper_path.fail) {
+            return -upper_path.error_code;
+        }
+
+        fprintf(stderr, "    -> Creating symlink in UPPER: %s\n", upper_path.value);
+
+        // Create parent directories in upper layer if needed
+        char upper_dir[PATH_MAX];
+        strncpy(upper_dir, upper_path.value, sizeof(upper_dir) - 1);
+        upper_dir[sizeof(upper_dir) - 1] = '\0';
+        char *last_slash = strrchr(upper_dir, '/');
+        if (last_slash && last_slash != upper_dir) {
+            *last_slash = '\0';
+
+            // mkdir -p implementation
+            for (char *p = upper_dir + 1; *p; p++) {
+                if (*p == '/') {
+                    *p = '\0';
+                    mkdir(upper_dir, 0755);
+                    *p = '/';
+                }
+            }
+            mkdir(upper_dir, 0755);
+        }
+
+        // Create the symlink in upper layer
+        res = symlink(from, upper_path.value);
+        if (res == -1) {
+            fprintf(stderr, "    -> Failed to create symlink: %s\n", strerror(errno));
+            return -errno;
+        }
+
+        // If there's a whiteout marker, remove it since we're creating a real file
+        char whiteout_path[PATH_MAX];
+        snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted%s",
+                overlay.upper_dir, to);
+        struct stat st;
+        if (lstat(whiteout_path, &st) == 0 && S_ISREG(st.st_mode)) {
+            fprintf(stderr, "    -> Removing whiteout marker: %s\n", whiteout_path);
+            unlink(whiteout_path);
+        }
+
+        return 0;
+    }
+
+    // Non-overlay path: use standard redirection
     struct path redirected = apply_wrapper_redirect_with_context(to, "SYMLINK", context);
 
     if (redirected.fail) {
