@@ -56,6 +56,11 @@ typedef enum {
     OVERLAY_NONE        // File doesn't exist anywhere
 } overlay_location_t;
 
+struct overlay_path {
+    overlay_location_t location;
+    char path[PATH_MAX];
+};
+
 // Structure to hold overlay detection results
 struct overlay_info {
     int found;
@@ -345,14 +350,57 @@ static struct path build_redirected_path(const char* original_path, const char* 
     return result;
 }
 
+// Function to concatenate paths (simplified version for direct buffer output)
+// Assumes output_path is PATH_MAX bytes
+static void concatenate_path(const char* original_path, const char* wrapper_value, char* output_path) {
+    // Special case: if original_path is just "/", return the wrapper_value directory
+    if (strcmp(original_path, "/") == 0) {
+        strncpy(output_path, wrapper_value, PATH_MAX - 1);
+        output_path[PATH_MAX - 1] = '\0';
+        return;
+    }
+
+    // If wrapper_value ends with '/', remove it to avoid double slashes
+    size_t wrapper_len = strlen(wrapper_value);
+    if (wrapper_len > 0 && wrapper_value[wrapper_len - 1] == '/') {
+        snprintf(output_path, PATH_MAX, "%.*s%s",
+                (int)(wrapper_len - 1), wrapper_value, original_path);
+    } else {
+        snprintf(output_path, PATH_MAX, "%s%s",
+                wrapper_value, original_path);
+    }
+}
+
+// Helper function to create parent directories for a file path (like mkdir -p)
+static void create_parent_directories(const char* file_path) {
+    char tmp[PATH_MAX];
+    strncpy(tmp, file_path, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    char *last_slash = strrchr(tmp, '/');
+    if (last_slash && last_slash != tmp) {
+        *last_slash = '\0';
+
+        // mkdir -p implementation
+        for (char *p = tmp + 1; *p; p++) {
+            if (*p == '/') {
+                *p = '\0';
+                mkdir(tmp, 0755);
+                *p = '/';
+            }
+        }
+        mkdir(tmp, 0755);
+    }
+}
+
 // Function to determine where a file exists in the overlay
 static overlay_location_t find_overlay_file_location(const char* original_path, const struct overlay_info* overlay,
-                                                     char* result_path, size_t result_size) {
+                                                     char* upper_path, char* lower_path) {
     struct stat st;
 
-    // Build paths for upper, lower, and whiteout locations
-    struct path upper_path_struct = build_redirected_path(original_path, overlay->upper_dir);
-    struct path lower_path_struct = build_redirected_path(original_path, overlay->lower_dir);
+    // Build paths for upper and lower locations using the provided buffers
+    concatenate_path(original_path, overlay->upper_dir, upper_path);
+    concatenate_path(original_path, overlay->lower_dir, lower_path);
 
     char whiteout_path[PATH_MAX];
 
@@ -364,8 +412,8 @@ static overlay_location_t find_overlay_file_location(const char* original_path, 
     }
 
     fprintf(stderr, "    Checking overlay locations for %s:\n", original_path);
-    fprintf(stderr, "      Upper: %s\n", upper_path_struct.value);
-    fprintf(stderr, "      Lower: %s\n", lower_path_struct.value);
+    fprintf(stderr, "      Upper: %s\n", upper_path);
+    fprintf(stderr, "      Lower: %s\n", lower_path);
     fprintf(stderr, "      Whiteout: %s\n", whiteout_path);
 
     // 1. Check if file is whiteout (deleted)
@@ -373,39 +421,23 @@ static overlay_location_t find_overlay_file_location(const char* original_path, 
     // The .deleted directory structure itself is not a whiteout
     if (lstat(whiteout_path, &st) == 0 && S_ISREG(st.st_mode)) {
         fprintf(stderr, "      -> WHITEOUT (file deleted)\n");
-        if (result_path && result_size > 0) {
-            strncpy(result_path, whiteout_path, result_size - 1);
-            result_path[result_size - 1] = '\0';
-        }
         return OVERLAY_WHITEOUT;
     }
 
     // 2. Check upper layer first
-    if (lstat(upper_path_struct.value, &st) == 0) {
+    if (lstat(upper_path, &st) == 0) {
         fprintf(stderr, "      -> UPPER (found in upper layer)\n");
-        if (result_path && result_size > 0) {
-            strncpy(result_path, upper_path_struct.value, result_size - 1);
-            result_path[result_size - 1] = '\0';
-        }
         return OVERLAY_UPPER;
     }
 
     // 3. Check lower layer
-    if (lstat(lower_path_struct.value, &st) == 0) {
+    if (lstat(lower_path, &st) == 0) {
         fprintf(stderr, "      -> LOWER (found in lower layer)\n");
-        if (result_path && result_size > 0) {
-            strncpy(result_path, lower_path_struct.value, result_size - 1);
-            result_path[result_size - 1] = '\0';
-        }
         return OVERLAY_LOWER;
     }
 
     // 4. File doesn't exist anywhere
     fprintf(stderr, "      -> NONE (file not found)\n");
-    if (result_path && result_size > 0) {
-        strncpy(result_path, upper_path_struct.value, result_size - 1);  // Default to upper for new files
-        result_path[result_size - 1] = '\0';
-    }
     return OVERLAY_NONE;
 }
 
@@ -435,7 +467,8 @@ static struct path apply_wrapper_redirect_with_context(const char* original_path
         struct overlay_info overlay = find_overlay_in_tree(context->pid);
         if (overlay.found && strlen(overlay.upper_dir) > 0) {
             // Overlay detected - use file location detection for proper overlay behavior
-            overlay_location_t location = find_overlay_file_location(original_path, &overlay, result.value, sizeof(result.value));
+            char upper_path[PATH_MAX], lower_path[PATH_MAX];
+            overlay_location_t location = find_overlay_file_location(original_path, &overlay, upper_path, lower_path);
 
             switch (location) {
                 case OVERLAY_WHITEOUT:
@@ -445,14 +478,20 @@ static struct path apply_wrapper_redirect_with_context(const char* original_path
                     return result;
 
                 case OVERLAY_UPPER:
+                    strncpy(result.value, upper_path, sizeof(result.value) - 1);
+                    result.value[sizeof(result.value) - 1] = '\0';
                     fprintf(stderr, "*** %s OVERLAY UPPER: %s -> %s ***\n", operation_name, original_path, result.value);
                     return result;
 
                 case OVERLAY_LOWER:
+                    strncpy(result.value, lower_path, sizeof(result.value) - 1);
+                    result.value[sizeof(result.value) - 1] = '\0';
                     fprintf(stderr, "*** %s OVERLAY LOWER: %s -> %s ***\n", operation_name, original_path, result.value);
                     return result;
 
                 case OVERLAY_NONE:
+                    strncpy(result.value, upper_path, sizeof(result.value) - 1);
+                    result.value[sizeof(result.value) - 1] = '\0';
                     fprintf(stderr, "*** %s OVERLAY NEW: %s -> %s (will create in upper) ***\n", operation_name, original_path, result.value);
                     return result;
             }
@@ -660,24 +699,35 @@ loopback_readlink(const char *path, char *buf, size_t size)
         fprintf(stderr, "*** READLINK OVERLAY: %s ***\n", path);
 
         // Find the symlink location in overlay
-        char result_path[PATH_MAX];
-        overlay_location_t location = find_overlay_file_location(path, &overlay, result_path, sizeof(result_path));
+        char upper_path[PATH_MAX], lower_path[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
 
-        if (location == OVERLAY_WHITEOUT) {
-            fprintf(stderr, "    -> Symlink is whiteout (deleted)\n");
-            return -ENOENT;
-        } else if (location == OVERLAY_UPPER || location == OVERLAY_LOWER) {
-            fprintf(stderr, "    -> Reading symlink from %s: %s\n",
-                    location == OVERLAY_UPPER ? "UPPER" : "LOWER", result_path);
-            res = readlink(result_path, buf, size - 1);
-            if (res == -1) {
-                return -errno;
-            }
-            buf[res] = '\0';
-            return 0;
-        } else {
-            fprintf(stderr, "    -> Symlink not found\n");
-            return -ENOENT;
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                fprintf(stderr, "    -> Symlink is whiteout (deleted)\n");
+                return -ENOENT;
+
+            case OVERLAY_UPPER:
+                fprintf(stderr, "    -> Reading symlink from UPPER: %s\n", upper_path);
+                res = readlink(upper_path, buf, size - 1);
+                if (res == -1) {
+                    return -errno;
+                }
+                buf[res] = '\0';
+                return 0;
+
+            case OVERLAY_LOWER:
+                fprintf(stderr, "    -> Reading symlink from LOWER: %s\n", lower_path);
+                res = readlink(lower_path, buf, size - 1);
+                if (res == -1) {
+                    return -errno;
+                }
+                buf[res] = '\0';
+                return 0;
+
+            case OVERLAY_NONE:
+                fprintf(stderr, "    -> Symlink not found\n");
+                return -ENOENT;
         }
     }
 
@@ -1234,7 +1284,8 @@ loopback_unlink(const char *path)
         struct overlay_info overlay = find_overlay_in_tree(context->pid);
         if (overlay.found && strlen(overlay.upper_dir) > 0) {
             // This is an overlay filesystem - use overlay delete logic
-            overlay_location_t location = find_overlay_file_location(path, &overlay, NULL, 0);
+            char upper_path[PATH_MAX], lower_path[PATH_MAX];
+            overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
 
             switch (location) {
                 case OVERLAY_WHITEOUT:
@@ -1245,9 +1296,8 @@ loopback_unlink(const char *path)
                 case OVERLAY_UPPER:
                     // File exists in upper layer - delete it normally
                     {
-                        struct path upper_path = build_redirected_path(path, overlay.upper_dir);
-                        fprintf(stderr, "*** UNLINK OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path.value);
-                        res = unlink(upper_path.value);
+                        fprintf(stderr, "*** UNLINK OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path);
+                        res = unlink(upper_path);
                         if (res == -1) {
                             return -errno;
                         }
@@ -1297,7 +1347,8 @@ loopback_rmdir(const char *path)
         struct overlay_info overlay = find_overlay_in_tree(context->pid);
         if (overlay.found && strlen(overlay.upper_dir) > 0) {
             // This is an overlay filesystem - use overlay delete logic
-            overlay_location_t location = find_overlay_file_location(path, &overlay, NULL, 0);
+            char upper_path[PATH_MAX], lower_path[PATH_MAX];
+            overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
 
             switch (location) {
                 case OVERLAY_WHITEOUT:
@@ -1308,9 +1359,8 @@ loopback_rmdir(const char *path)
                 case OVERLAY_UPPER:
                     // Directory exists in upper layer - delete it normally
                     {
-                        struct path upper_path = build_redirected_path(path, overlay.upper_dir);
-                        fprintf(stderr, "*** RMDIR OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path.value);
-                        res = rmdir(upper_path.value);
+                        fprintf(stderr, "*** RMDIR OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path);
+                        res = rmdir(upper_path);
                         if (res == -1) {
                             return -errno;
                         }
@@ -1361,41 +1411,23 @@ loopback_symlink(const char *from, const char *to)
         fprintf(stderr, "*** SYMLINK OVERLAY: %s -> %s ***\n", to, from);
 
         // Symlinks are always created in upper layer (write operation)
-        struct path upper_path = build_redirected_path(to, overlay.upper_dir);
-        if (upper_path.fail) {
-            return -upper_path.error_code;
-        }
+        char upper_path[PATH_MAX];
+        concatenate_path(to, overlay.upper_dir, upper_path);
 
-        fprintf(stderr, "    -> Creating symlink in UPPER: %s\n", upper_path.value);
+        fprintf(stderr, "    -> Creating symlink in UPPER: %s\n", upper_path);
 
         // Create parent directories in upper layer if needed
-        char upper_dir[PATH_MAX];
-        strncpy(upper_dir, upper_path.value, sizeof(upper_dir) - 1);
-        upper_dir[sizeof(upper_dir) - 1] = '\0';
-        char *last_slash = strrchr(upper_dir, '/');
-        if (last_slash && last_slash != upper_dir) {
-            *last_slash = '\0';
-
-            // mkdir -p implementation
-            for (char *p = upper_dir + 1; *p; p++) {
-                if (*p == '/') {
-                    *p = '\0';
-                    mkdir(upper_dir, 0755);
-                    *p = '/';
-                }
-            }
-            mkdir(upper_dir, 0755);
-        }
+        create_parent_directories(upper_path);
 
         // Create the symlink in upper layer
-        res = symlink(from, upper_path.value);
+        res = symlink(from, upper_path);
         if (res == -1) {
             fprintf(stderr, "    -> Failed to create symlink: %s\n", strerror(errno));
             return -errno;
         }
 
         // Set ownership to calling user (new file creation)
-        if (context && lchown(upper_path.value, context->uid, context->gid) == -1) {
+        if (context && lchown(upper_path, context->uid, context->gid) == -1) {
             fprintf(stderr, "    Warning: Failed to set symlink ownership: %s\n", strerror(errno));
         }
 
@@ -1483,15 +1515,26 @@ loopback_link(const char *from, const char *to)
         fprintf(stderr, "*** LINK OVERLAY: %s -> %s ***\n", from, to);
 
         // Find the source file location
-        char from_real_path[PATH_MAX];
-        overlay_location_t from_location = find_overlay_file_location(from, &overlay, from_real_path, sizeof(from_real_path));
+        char from_upper_path[PATH_MAX], from_lower_path[PATH_MAX];
+        overlay_location_t from_location = find_overlay_file_location(from, &overlay, from_upper_path, from_lower_path);
 
-        if (from_location == OVERLAY_WHITEOUT) {
-            fprintf(stderr, "    -> Source file is whiteout (deleted)\n");
-            return -ENOENT;
-        } else if (from_location == OVERLAY_NONE) {
-            fprintf(stderr, "    -> Source file does not exist\n");
-            return -ENOENT;
+        const char *from_real_path;
+        switch (from_location) {
+            case OVERLAY_WHITEOUT:
+                fprintf(stderr, "    -> Source file is whiteout (deleted)\n");
+                return -ENOENT;
+
+            case OVERLAY_NONE:
+                fprintf(stderr, "    -> Source file does not exist\n");
+                return -ENOENT;
+
+            case OVERLAY_UPPER:
+                from_real_path = from_upper_path;
+                break;
+
+            case OVERLAY_LOWER:
+                from_real_path = from_lower_path;
+                break;
         }
 
         // Destination is always in upper layer (write operation)
@@ -1501,23 +1544,7 @@ loopback_link(const char *from, const char *to)
         }
 
         // Create parent directories in upper layer if needed
-        char upper_dir[PATH_MAX];
-        strncpy(upper_dir, to_upper_path.value, sizeof(upper_dir) - 1);
-        upper_dir[sizeof(upper_dir) - 1] = '\0';
-        char *last_slash = strrchr(upper_dir, '/');
-        if (last_slash && last_slash != upper_dir) {
-            *last_slash = '\0';
-
-            // mkdir -p implementation
-            for (char *p = upper_dir + 1; *p; p++) {
-                if (*p == '/') {
-                    *p = '\0';
-                    mkdir(upper_dir, 0755);
-                    *p = '/';
-                }
-            }
-            mkdir(upper_dir, 0755);
-        }
+        create_parent_directories(to_upper_path.value);
 
         // If source is in lower layer, we need to copy it to upper first
         // (can't create hard links across different filesystems)
@@ -1711,38 +1738,35 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
         fprintf(stderr, "*** SETATTR_X OVERLAY: %s ***\n", path);
 
         // Find the file location in overlay
-        char result_path[PATH_MAX];
-        overlay_location_t location = find_overlay_file_location(path, &overlay, result_path, sizeof(result_path));
+        char upper_path_buf[PATH_MAX], lower_path_buf[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path_buf, lower_path_buf);
 
-        if (location == OVERLAY_WHITEOUT) {
-            fprintf(stderr, "    -> File is whiteout (deleted)\n");
-            return -ENOENT;
-        } else if (location == OVERLAY_NONE) {
-            fprintf(stderr, "    -> File does not exist\n");
-            return -ENOENT;
-        }
-
-        // If file is in lower layer, copy it up first (OverlayFS semantics)
         const char *target_path;
-        if (location == OVERLAY_LOWER) {
-            fprintf(stderr, "    -> File in LOWER, copying to UPPER before setattr\n");
-            struct path upper_path = build_redirected_path(path, overlay.upper_dir);
-            if (upper_path.fail) {
-                return -upper_path.error_code;
-            }
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                fprintf(stderr, "    -> File is whiteout (deleted)\n");
+                return -ENOENT;
 
-            // Copy from lower to upper
-            res = copy_file_to_upper(result_path, upper_path.value);
-            if (res < 0) {
-                fprintf(stderr, "    -> Failed to copy file to upper: %d\n", res);
-                return res;
-            }
+            case OVERLAY_NONE:
+                fprintf(stderr, "    -> File does not exist\n");
+                return -ENOENT;
 
-            target_path = upper_path.value;
-        } else {
-            // File already in upper layer
-            fprintf(stderr, "    -> File in UPPER, applying setattr directly\n");
-            target_path = result_path;
+            case OVERLAY_LOWER:
+                // Copy from lower to upper first (OverlayFS semantics)
+                fprintf(stderr, "    -> File in LOWER, copying to UPPER before setattr\n");
+                res = copy_file_to_upper(lower_path_buf, upper_path_buf);
+                if (res < 0) {
+                    fprintf(stderr, "    -> Failed to copy file to upper: %d\n", res);
+                    return res;
+                }
+                target_path = upper_path_buf;
+                break;
+
+            case OVERLAY_UPPER:
+                // File already in upper layer
+                fprintf(stderr, "    -> File in UPPER, applying setattr directly\n");
+                target_path = upper_path_buf;
+                break;
         }
 
         // Now apply all setattr operations to the upper layer file
@@ -2044,23 +2068,7 @@ static int copy_file_to_upper(const char* lower_path, const char* upper_path) {
     }
 
     // Create parent directories in upper layer if needed
-    char upper_dir[PATH_MAX];
-    strncpy(upper_dir, upper_path, sizeof(upper_dir) - 1);
-    upper_dir[sizeof(upper_dir) - 1] = '\0';
-    char *last_slash = strrchr(upper_dir, '/');
-    if (last_slash && last_slash != upper_dir) {
-        *last_slash = '\0';
-
-        // mkdir -p implementation
-        for (char *p = upper_dir + 1; *p; p++) {
-            if (*p == '/') {
-                *p = '\0';
-                mkdir(upper_dir, 0755);
-                *p = '/';
-            }
-        }
-        mkdir(upper_dir, 0755);
-    }
+    create_parent_directories(upper_path);
 
     // Create destination file (upper layer)
     int dst_fd = open(upper_path, O_WRONLY | O_CREAT | O_TRUNC, st.st_mode);
@@ -2152,41 +2160,44 @@ loopback_open(const char *path, struct fuse_file_info *fi)
 
             if (needs_write) {
                 // Find where the file currently exists
-                char result_path[PATH_MAX];
-                overlay_location_t location = find_overlay_file_location(path, &overlay, result_path, sizeof(result_path));
+                char upper_path_buf[PATH_MAX], lower_path_buf[PATH_MAX];
+                overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path_buf, lower_path_buf);
 
-                if (location == OVERLAY_LOWER) {
-                    // File exists only in lower layer and we're opening for write
-                    // Need to copy it to upper layer first (copy-on-write)
-                    struct path upper_path = build_redirected_path(path, overlay.upper_dir);
-                    fprintf(stderr, "*** OPEN COPY-ON-WRITE: %s in lower, copying to upper %s ***\n",
-                            path, upper_path.value);
+                switch (location) {
+                    case OVERLAY_WHITEOUT:
+                        // File is deleted
+                        return -ENOENT;
 
-                    int res = copy_file_to_upper(result_path, upper_path.value);
-                    if (res < 0) {
-                        return res;
-                    }
+                    case OVERLAY_LOWER:
+                        // File exists only in lower layer and we're opening for write
+                        // Need to copy it to upper layer first (copy-on-write)
+                        fprintf(stderr, "*** OPEN COPY-ON-WRITE: %s in lower, copying to upper %s ***\n",
+                                path, upper_path_buf);
 
-                    // Now open the upper layer copy
-                    fd = open(upper_path.value, fi->flags);
-                    if (fd == -1) {
-                        return -errno;
-                    }
+                        int res = copy_file_to_upper(lower_path_buf, upper_path_buf);
+                        if (res < 0) {
+                            return res;
+                        }
 
-                    fi->fh = fd;
-                    return 0;
-                } else if (location == OVERLAY_WHITEOUT) {
-                    // File is deleted
-                    return -ENOENT;
-                } else if (location == OVERLAY_UPPER || location == OVERLAY_NONE) {
-                    // File in upper or doesn't exist - use normal path resolution
-                    fd = open(result_path, fi->flags);
-                    if (fd == -1) {
-                        return -errno;
-                    }
+                        // Now open the upper layer copy
+                        fd = open(upper_path_buf, fi->flags);
+                        if (fd == -1) {
+                            return -errno;
+                        }
 
-                    fi->fh = fd;
-                    return 0;
+                        fi->fh = fd;
+                        return 0;
+
+                    case OVERLAY_UPPER:
+                    case OVERLAY_NONE:
+                        // File in upper or doesn't exist - use normal path resolution
+                        fd = open(upper_path_buf, fi->flags);
+                        if (fd == -1) {
+                            return -errno;
+                        }
+
+                        fi->fh = fd;
+                        return 0;
                 }
             }
         }
