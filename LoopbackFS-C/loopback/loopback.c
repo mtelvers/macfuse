@@ -409,8 +409,9 @@ static overlay_location_t find_overlay_file_location(const char* original_path, 
     return OVERLAY_NONE;
 }
 
-// Forward declaration
+// Forward declarations
 static struct overlay_info find_overlay_in_tree(pid_t starting_pid);
+static int copy_file_to_upper(const char* lower_path, const char* upper_path);
 
 // Helper function to apply wrapper detection and path redirection
 static struct path apply_wrapper_redirect_with_context(const char* original_path, const char* operation_name, struct fuse_context *context) {
@@ -1393,6 +1394,11 @@ loopback_symlink(const char *from, const char *to)
             return -errno;
         }
 
+        // Set ownership to calling user (new file creation)
+        if (context && lchown(upper_path.value, context->uid, context->gid) == -1) {
+            fprintf(stderr, "    Warning: Failed to set symlink ownership: %s\n", strerror(errno));
+        }
+
         // If there's a whiteout marker, remove it since we're creating a real file
         char whiteout_path[PATH_MAX];
         snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted%s",
@@ -1469,7 +1475,100 @@ static int
 loopback_link(const char *from, const char *to)
 {
     int res;
+    struct fuse_context *context = fuse_get_context();
 
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** LINK OVERLAY: %s -> %s ***\n", from, to);
+
+        // Find the source file location
+        char from_real_path[PATH_MAX];
+        overlay_location_t from_location = find_overlay_file_location(from, &overlay, from_real_path, sizeof(from_real_path));
+
+        if (from_location == OVERLAY_WHITEOUT) {
+            fprintf(stderr, "    -> Source file is whiteout (deleted)\n");
+            return -ENOENT;
+        } else if (from_location == OVERLAY_NONE) {
+            fprintf(stderr, "    -> Source file does not exist\n");
+            return -ENOENT;
+        }
+
+        // Destination is always in upper layer (write operation)
+        struct path to_upper_path = build_redirected_path(to, overlay.upper_dir);
+        if (to_upper_path.fail) {
+            return -to_upper_path.error_code;
+        }
+
+        // Create parent directories in upper layer if needed
+        char upper_dir[PATH_MAX];
+        strncpy(upper_dir, to_upper_path.value, sizeof(upper_dir) - 1);
+        upper_dir[sizeof(upper_dir) - 1] = '\0';
+        char *last_slash = strrchr(upper_dir, '/');
+        if (last_slash && last_slash != upper_dir) {
+            *last_slash = '\0';
+
+            // mkdir -p implementation
+            for (char *p = upper_dir + 1; *p; p++) {
+                if (*p == '/') {
+                    *p = '\0';
+                    mkdir(upper_dir, 0755);
+                    *p = '/';
+                }
+            }
+            mkdir(upper_dir, 0755);
+        }
+
+        // If source is in lower layer, we need to copy it to upper first
+        // (can't create hard links across different filesystems)
+        char from_upper_path_buf[PATH_MAX];
+        const char *from_link_path;
+
+        if (from_location == OVERLAY_LOWER) {
+            fprintf(stderr, "    -> Source in LOWER, copying to UPPER first\n");
+            struct path from_upper = build_redirected_path(from, overlay.upper_dir);
+            if (from_upper.fail) {
+                return -from_upper.error_code;
+            }
+            strncpy(from_upper_path_buf, from_upper.value, sizeof(from_upper_path_buf) - 1);
+            from_upper_path_buf[sizeof(from_upper_path_buf) - 1] = '\0';
+
+            // Copy the file from lower to upper (breaking any existing hard links)
+            res = copy_file_to_upper(from_real_path, from_upper_path_buf);
+            if (res < 0) {
+                fprintf(stderr, "    -> Failed to copy file to upper: %d\n", res);
+                return res;
+            }
+
+            from_link_path = from_upper_path_buf;
+        } else {
+            // Source is already in upper layer
+            fprintf(stderr, "    -> Source in UPPER, creating hard link\n");
+            from_link_path = from_real_path;
+        }
+
+        // Create the hard link in upper layer
+        res = link(from_link_path, to_upper_path.value);
+        if (res == -1) {
+            fprintf(stderr, "    -> Failed to create hard link: %s\n", strerror(errno));
+            return -errno;
+        }
+
+        // If there's a whiteout marker for 'to', remove it
+        char whiteout_path[PATH_MAX];
+        snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted%s",
+                overlay.upper_dir, to);
+        struct stat st;
+        if (lstat(whiteout_path, &st) == 0 && S_ISREG(st.st_mode)) {
+            fprintf(stderr, "    -> Removing whiteout marker: %s\n", whiteout_path);
+            unlink(whiteout_path);
+        }
+
+        fprintf(stderr, "    -> Hard link created successfully\n");
+        return 0;
+    }
+
+    // Non-overlay path: use standard link
     res = link(from, to);
     if (res == -1) {
         return -errno;
@@ -1605,6 +1704,162 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
     uid_t uid = -1;
     gid_t gid = -1;
     struct fuse_context *context = fuse_get_context();
+
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** SETATTR_X OVERLAY: %s ***\n", path);
+
+        // Find the file location in overlay
+        char result_path[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, result_path, sizeof(result_path));
+
+        if (location == OVERLAY_WHITEOUT) {
+            fprintf(stderr, "    -> File is whiteout (deleted)\n");
+            return -ENOENT;
+        } else if (location == OVERLAY_NONE) {
+            fprintf(stderr, "    -> File does not exist\n");
+            return -ENOENT;
+        }
+
+        // If file is in lower layer, copy it up first (OverlayFS semantics)
+        const char *target_path;
+        if (location == OVERLAY_LOWER) {
+            fprintf(stderr, "    -> File in LOWER, copying to UPPER before setattr\n");
+            struct path upper_path = build_redirected_path(path, overlay.upper_dir);
+            if (upper_path.fail) {
+                return -upper_path.error_code;
+            }
+
+            // Copy from lower to upper
+            res = copy_file_to_upper(result_path, upper_path.value);
+            if (res < 0) {
+                fprintf(stderr, "    -> Failed to copy file to upper: %d\n", res);
+                return res;
+            }
+
+            target_path = upper_path.value;
+        } else {
+            // File already in upper layer
+            fprintf(stderr, "    -> File in UPPER, applying setattr directly\n");
+            target_path = result_path;
+        }
+
+        // Now apply all setattr operations to the upper layer file
+        if (SETATTR_WANTS_MODE(attr)) {
+            res = lchmod(target_path, attr->mode);
+            if (res == -1) {
+                return -errno;
+            }
+        }
+
+        if (SETATTR_WANTS_UID(attr)) {
+            uid = attr->uid;
+        }
+
+        if (SETATTR_WANTS_GID(attr)) {
+            gid = attr->gid;
+        }
+
+        if ((uid != -1) || (gid != -1)) {
+            res = lchown(target_path, uid, gid);
+            if (res == -1) {
+                return -errno;
+            }
+        }
+
+        if (SETATTR_WANTS_SIZE(attr)) {
+            res = truncate(target_path, attr->size);
+            if (res == -1) {
+                return -errno;
+            }
+        }
+
+        if (SETATTR_WANTS_MODTIME(attr)) {
+            struct timeval tv[2];
+            if (!SETATTR_WANTS_ACCTIME(attr)) {
+                gettimeofday(&tv[0], NULL);
+            } else {
+                tv[0].tv_sec = attr->acctime.tv_sec;
+                tv[0].tv_usec = attr->acctime.tv_nsec / 1000;
+            }
+            tv[1].tv_sec = attr->modtime.tv_sec;
+            tv[1].tv_usec = attr->modtime.tv_nsec / 1000;
+            res = lutimes(target_path, tv);
+            if (res == -1) {
+                return -errno;
+            }
+        }
+
+        if (SETATTR_WANTS_CRTIME(attr)) {
+            struct attrlist attributes;
+
+            attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
+            attributes.reserved = 0;
+            attributes.commonattr = ATTR_CMN_CRTIME;
+            attributes.dirattr = 0;
+            attributes.fileattr = 0;
+            attributes.forkattr = 0;
+            attributes.volattr = 0;
+
+            res = setattrlist(target_path, &attributes, &attr->crtime,
+                              sizeof(struct timespec), FSOPT_NOFOLLOW);
+
+            if (res == -1) {
+                return -errno;
+            }
+        }
+
+        if (SETATTR_WANTS_CHGTIME(attr)) {
+            struct attrlist attributes;
+
+            attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
+            attributes.reserved = 0;
+            attributes.commonattr = ATTR_CMN_CHGTIME;
+            attributes.dirattr = 0;
+            attributes.fileattr = 0;
+            attributes.forkattr = 0;
+            attributes.volattr = 0;
+
+            res = setattrlist(target_path, &attributes, &attr->chgtime,
+                              sizeof(struct timespec), FSOPT_NOFOLLOW);
+
+            if (res == -1) {
+                return -errno;
+            }
+        }
+
+        if (SETATTR_WANTS_BKUPTIME(attr)) {
+            struct attrlist attributes;
+
+            attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
+            attributes.reserved = 0;
+            attributes.commonattr = ATTR_CMN_BKUPTIME;
+            attributes.dirattr = 0;
+            attributes.fileattr = 0;
+            attributes.forkattr = 0;
+            attributes.volattr = 0;
+
+            res = setattrlist(target_path, &attributes, &attr->bkuptime,
+                              sizeof(struct timespec), FSOPT_NOFOLLOW);
+
+            if (res == -1) {
+                return -errno;
+            }
+        }
+
+        if (SETATTR_WANTS_FLAGS(attr)) {
+            res = lchflags(target_path, attr->flags);
+            if (res == -1) {
+                return -errno;
+            }
+        }
+
+        fprintf(stderr, "    -> Setattr completed successfully\n");
+        return 0;
+    }
+
+    // Non-overlay path: use standard redirection
     struct path redirected = apply_wrapper_redirect_with_context(path, "SETATTR_X", context);
 
     if (redirected.fail) {
@@ -1771,7 +2026,7 @@ loopback_getxtimes(const char *path, struct timespec *bkuptime,
 }
 
 // Helper function to copy a file from lower layer to upper layer (copy-on-write)
-static int copy_file_to_upper(const char* lower_path, const char* upper_path, struct fuse_context *context) {
+static int copy_file_to_upper(const char* lower_path, const char* upper_path) {
     fprintf(stderr, "    Copy-on-write: copying %s -> %s\n", lower_path, upper_path);
 
     // Open source file (lower layer)
@@ -1837,9 +2092,9 @@ static int copy_file_to_upper(const char* lower_path, const char* upper_path, st
         return -errno;
     }
 
-    // Set ownership to calling user
-    if (context && fchown(dst_fd, context->uid, context->gid) == -1) {
-        fprintf(stderr, "    Warning: Failed to set ownership: %s\n", strerror(errno));
+    // Preserve ownership from source file (OverlayFS semantics)
+    if (fchown(dst_fd, st.st_uid, st.st_gid) == -1) {
+        fprintf(stderr, "    Warning: Failed to preserve ownership: %s\n", strerror(errno));
     }
 
     // Preserve timestamps
@@ -1907,7 +2162,7 @@ loopback_open(const char *path, struct fuse_file_info *fi)
                     fprintf(stderr, "*** OPEN COPY-ON-WRITE: %s in lower, copying to upper %s ***\n",
                             path, upper_path.value);
 
-                    int res = copy_file_to_upper(result_path, upper_path.value, context);
+                    int res = copy_file_to_upper(result_path, upper_path.value);
                     if (res < 0) {
                         return res;
                     }
