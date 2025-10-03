@@ -1069,6 +1069,23 @@ loopback_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
     // Simple heuristic: if first byte is 1, it's likely an overlay_dirp
     if (od && od->is_overlay) {
+        // If offset is 0, rebuild the directory entries (like rewinddir for regular dirs)
+        if (offset == 0) {
+            // Free old entries
+            for (int i = 0; i < od->entry_count; i++) {
+                free(od->merged_entries[i]);
+            }
+            free(od->merged_entries);
+
+            // Rebuild merged entries
+            int res = merge_overlay_directory_entries(od->original_path, &od->overlay_info,
+                                                      &od->merged_entries, &od->entry_count);
+            if (res < 0) {
+                return res;
+            }
+            od->current_index = 0;
+        }
+
         // Handle overlay directory - merged listing
         fprintf(stderr, "    Reading overlay directory: %s (offset=%lld, entries=%d)\n",
                 od->original_path, (long long)offset, od->entry_count);
@@ -1357,12 +1374,23 @@ loopback_unlink(const char *path)
                 return -ENOENT;
 
             case OVERLAY_UPPER:
-                // File exists in upper layer - delete it normally
+                // File exists in upper layer - delete it
                 {
                     fprintf(stderr, "*** UNLINK OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path);
                     res = unlink(upper_path);
                     if (res == -1) {
                         return -errno;
+                    }
+
+                    // Check if file also exists in lower layer
+                    struct stat lower_st;
+                    if (lstat(lower_path, &lower_st) == 0) {
+                        // File exists in lower - create whiteout marker to hide it
+                        fprintf(stderr, "    -> File also in lower, creating whiteout marker\n");
+                        res = create_whiteout_marker(path, &overlay);
+                        if (res < 0) {
+                            return res;
+                        }
                     }
                     return 0;
                 }
@@ -1420,12 +1448,23 @@ loopback_rmdir(const char *path)
                 return -ENOENT;
 
             case OVERLAY_UPPER:
-                // Directory exists in upper layer - delete it normally
+                // Directory exists in upper layer - delete it
                 {
                     fprintf(stderr, "*** RMDIR OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path);
                     res = rmdir(upper_path);
                     if (res == -1) {
                         return -errno;
+                    }
+
+                    // Check if directory also exists in lower layer
+                    struct stat lower_st;
+                    if (lstat(lower_path, &lower_st) == 0 && S_ISDIR(lower_st.st_mode)) {
+                        // Directory exists in lower - create whiteout marker to hide it
+                        fprintf(stderr, "    -> Directory also in lower, creating whiteout marker\n");
+                        res = create_whiteout_marker(path, &overlay);
+                        if (res < 0) {
+                            return res;
+                        }
                     }
                     return 0;
                 }
