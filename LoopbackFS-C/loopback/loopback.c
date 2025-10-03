@@ -44,7 +44,6 @@
 
 struct path {
     bool fail;
-    int error_code;  // errno value to return (e.g., ENOENT for whiteout)
     char value[PATH_MAX];
 };
 
@@ -55,11 +54,6 @@ typedef enum {
     OVERLAY_WHITEOUT,   // File is marked as deleted
     OVERLAY_NONE        // File doesn't exist anywhere
 } overlay_location_t;
-
-struct overlay_path {
-    overlay_location_t location;
-    char path[PATH_MAX];
-};
 
 // Structure to hold overlay detection results
 struct overlay_info {
@@ -206,7 +200,7 @@ static pid_t get_parent_pid(pid_t pid) {
 
 // Function to get specific environment variable value from process
 static struct path get_env_from_process(pid_t pid, const char* env_name) {
-    struct path result = { .fail = true, .error_code = 0 };
+    struct path result = { .fail = true };
 
     // Get the full process args and environment data
     int mib[3] = { CTL_KERN, KERN_PROCARGS2, pid };
@@ -326,31 +320,7 @@ static struct path get_env_from_process(pid_t pid, const char* env_name) {
     return result;
 }
 
-// Function to build redirected path based on wrapper value
-static struct path build_redirected_path(const char* original_path, const char* wrapper_value) {
-    struct path result = { .fail = false, .error_code = 0 };
-
-    // Special case: if original_path is just "/", return the wrapper_value directory
-    if (strcmp(original_path, "/") == 0) {
-        strncpy(result.value, wrapper_value, sizeof(result.value) - 1);
-        result.value[sizeof(result.value) - 1] = '\0';
-        return result;
-    }
-
-    // If wrapper_value ends with '/', remove it to avoid double slashes
-    size_t wrapper_len = strlen(wrapper_value);
-    if (wrapper_len > 0 && wrapper_value[wrapper_len - 1] == '/') {
-        snprintf(result.value, sizeof(result.value), "%.*s%s",
-                (int)(wrapper_len - 1), wrapper_value, original_path);
-    } else {
-        snprintf(result.value, sizeof(result.value), "%s%s",
-                wrapper_value, original_path);
-    }
-
-    return result;
-}
-
-// Function to concatenate paths (simplified version for direct buffer output)
+// Function to concatenate paths
 // Assumes output_path is PATH_MAX bytes
 static void concatenate_path(const char* original_path, const char* wrapper_value, char* output_path) {
     // Special case: if original_path is just "/", return the wrapper_value directory
@@ -390,6 +360,17 @@ static void create_parent_directories(const char* file_path) {
             }
         }
         mkdir(tmp, 0755);
+    }
+}
+
+// Helper function to remove whiteout marker when creating a new file/directory
+static void remove_whiteout_marker(const char* upper_dir, const char* path) {
+    char whiteout_path[PATH_MAX];
+    snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted%s", upper_dir, path);
+    struct stat st;
+    if (lstat(whiteout_path, &st) == 0 && S_ISREG(st.st_mode)) {
+        fprintf(stderr, "    -> Removing whiteout marker: %s\n", whiteout_path);
+        unlink(whiteout_path);
     }
 }
 
@@ -446,70 +427,34 @@ static struct overlay_info find_overlay_in_tree(pid_t starting_pid);
 static int copy_file_to_upper(const char* lower_path, const char* upper_path);
 
 // Helper function to apply wrapper detection and path redirection
-static struct path apply_wrapper_redirect_with_context(const char* original_path, const char* operation_name, struct fuse_context *context) {
-    struct path result = { .fail = false, .error_code = 0 };
-
-    if (context) {
-        // Check if this is fseventsd - return early to avoid conflicts
-        char proc_name[PROC_PIDPATHINFO_MAXSIZE];
-        if (proc_pidpath(context->pid, proc_name, sizeof(proc_name)) > 0) {
-            char *basename = strrchr(proc_name, '/');
-            basename = basename ? basename + 1 : proc_name;
-
-            if (strcmp(basename, "fseventsd") == 0) {
-                fprintf(stderr, "*** %s BLOCKING fseventsd PID %d ***\n", operation_name, context->pid);
-                result.fail = true;
-                result.error_code = ENOTSUP;
-                return result;
-            }
-        }
-
-        struct overlay_info overlay = find_overlay_in_tree(context->pid);
-        if (overlay.found && strlen(overlay.upper_dir) > 0) {
-            // Overlay detected - use file location detection for proper overlay behavior
-            char upper_path[PATH_MAX], lower_path[PATH_MAX];
-            overlay_location_t location = find_overlay_file_location(original_path, &overlay, upper_path, lower_path);
-
-            switch (location) {
-                case OVERLAY_WHITEOUT:
-                    fprintf(stderr, "*** %s OVERLAY WHITEOUT: %s (file deleted) ***\n", operation_name, original_path);
-                    result.fail = true;
-                    result.error_code = ENOENT;  // Return ENOENT for whiteout files
-                    return result;
-
-                case OVERLAY_UPPER:
-                    strncpy(result.value, upper_path, sizeof(result.value) - 1);
-                    result.value[sizeof(result.value) - 1] = '\0';
-                    fprintf(stderr, "*** %s OVERLAY UPPER: %s -> %s ***\n", operation_name, original_path, result.value);
-                    return result;
-
-                case OVERLAY_LOWER:
-                    strncpy(result.value, lower_path, sizeof(result.value) - 1);
-                    result.value[sizeof(result.value) - 1] = '\0';
-                    fprintf(stderr, "*** %s OVERLAY LOWER: %s -> %s ***\n", operation_name, original_path, result.value);
-                    return result;
-
-                case OVERLAY_NONE:
-                    strncpy(result.value, upper_path, sizeof(result.value) - 1);
-                    result.value[sizeof(result.value) - 1] = '\0';
-                    fprintf(stderr, "*** %s OVERLAY NEW: %s -> %s (will create in upper) ***\n", operation_name, original_path, result.value);
-                    return result;
-            }
-        }
+// Helper function to check if we should block fseventsd
+static bool should_block_fseventsd(struct fuse_context *context, const char* operation_name) {
+    if (!context) {
+        return false;
     }
 
-    // No wrapper - pass through to backup location (original content)
+    char proc_name[PROC_PIDPATHINFO_MAXSIZE];
+    if (proc_pidpath(context->pid, proc_name, sizeof(proc_name)) > 0) {
+        char *basename = strrchr(proc_name, '/');
+        basename = basename ? basename + 1 : proc_name;
+
+        if (strcmp(basename, "fseventsd") == 0) {
+            fprintf(stderr, "*** %s BLOCKING fseventsd PID %d ***\n", operation_name, context->pid);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Helper function to get the passthrough path (backup or original)
+static void get_passthrough_path(const char* original_path, char* result_path) {
     if (loopback.backup_created) {
-        struct path backup_path = build_redirected_path(original_path, loopback.backup_path);
-        strncpy(result.value, backup_path.value, sizeof(result.value) - 1);
-        result.value[sizeof(result.value) - 1] = '\0';
-        fprintf(stderr, "*** %s PASSTHROUGH: %s -> %s ***\n", operation_name, original_path, result.value);
-        return result;
+        concatenate_path(original_path, loopback.backup_path, result_path);
+        fprintf(stderr, "*** PASSTHROUGH: %s -> %s ***\n", original_path, result_path);
+    } else {
+        strncpy(result_path, original_path, PATH_MAX - 1);
+        result_path[PATH_MAX - 1] = '\0';
     }
-
-    strncpy(result.value, original_path, sizeof(result.value) - 1);
-    result.value[sizeof(result.value) - 1] = '\0';
-    return result;
 }
 
 // Function to find WRAPPER_UPPER and WRAPPER_LOWER environment variables in process tree
@@ -555,57 +500,59 @@ static struct overlay_info find_overlay_in_tree(pid_t starting_pid) {
     return result;
 }
 
-// Function to print process tree for debugging
-static void print_process_tree(pid_t starting_pid) {
-    pid_t current_pid = starting_pid;
-    char proc_name[PROC_PIDPATHINFO_MAXSIZE];
-
-    fprintf(stderr, "Process tree for PID %d:\n", starting_pid);
-
-    int depth = 0;
-    while (current_pid > 1 && depth < 10) { // Limit depth to avoid infinite loops
-        // Get process name
-        if (proc_pidpath(current_pid, proc_name, sizeof(proc_name)) > 0) {
-            // Extract just the executable name from full path
-            char *basename = strrchr(proc_name, '/');
-            if (basename) {
-                basename++;
-            } else {
-                basename = proc_name;
-            }
-
-            // Print with indentation
-            for (int i = 0; i < depth; i++) fprintf(stderr, "  ");
-            fprintf(stderr, "PID %d: %s\n", current_pid, basename);
-        } else {
-            for (int i = 0; i < depth; i++) fprintf(stderr, "  ");
-            fprintf(stderr, "PID %d: <unknown>\n", current_pid);
-        }
-
-        // Get parent PID
-        pid_t parent_pid = get_parent_pid(current_pid);
-        if (parent_pid <= 0) {
-            break;
-        }
-
-        current_pid = parent_pid;
-        depth++;
-    }
-    fprintf(stderr, "\n");
-}
-
 static int
 loopback_getattr(const char *path, struct stat *stbuf)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected = apply_wrapper_redirect_with_context(path, "GETATTR", context);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "GETATTR")) {
+        return -ENOTSUP;
     }
 
-    res = lstat(redirected.value, stbuf);
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** GETATTR OVERLAY: %s ***\n", path);
+
+        // Find the file location in overlay
+        char upper_path[PATH_MAX], lower_path[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
+
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                fprintf(stderr, "    -> File is whiteout (deleted)\n");
+                return -ENOENT;
+
+            case OVERLAY_UPPER:
+                fprintf(stderr, "    -> Reading attributes from UPPER: %s\n", upper_path);
+                res = lstat(upper_path, stbuf);
+                break;
+
+            case OVERLAY_LOWER:
+                fprintf(stderr, "    -> Reading attributes from LOWER: %s\n", lower_path);
+                res = lstat(lower_path, stbuf);
+                break;
+
+            case OVERLAY_NONE:
+                fprintf(stderr, "    -> File not found\n");
+                return -ENOENT;
+        }
+
+        if (res == -1) {
+            return -errno;
+        }
+
+        stbuf->st_blksize = 0;
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
+
+    res = lstat(redirected, stbuf);
 
     /*
      * The optimal I/O size can be set on a per-file basis. Setting st_blksize
@@ -626,6 +573,12 @@ loopback_fgetattr(const char *path, struct stat *stbuf,
                   struct fuse_file_info *fi)
 {
     int res;
+    struct fuse_context *context = fuse_get_context();
+
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "FGETATTR")) {
+        return -ENOTSUP;
+    }
 
     (void)path;
 
@@ -648,11 +601,51 @@ loopback_access(const char *path, int mask)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected = apply_wrapper_redirect_with_context(path, "ACCESS", context);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "ACCESS")) {
+        return -ENOTSUP;
     }
+
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** ACCESS OVERLAY: %s (mask=%d) ***\n", path, mask);
+
+        // Find the file location in overlay
+        char upper_path[PATH_MAX], lower_path[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
+
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                fprintf(stderr, "    -> File is whiteout (deleted)\n");
+                return -ENOENT;
+
+            case OVERLAY_UPPER:
+                fprintf(stderr, "    -> Checking access from UPPER: %s\n", upper_path);
+                res = access(upper_path, mask & (F_OK | X_OK | W_OK | R_OK));
+                break;
+
+            case OVERLAY_LOWER:
+                fprintf(stderr, "    -> Checking access from LOWER: %s\n", lower_path);
+                res = access(lower_path, mask & (F_OK | X_OK | W_OK | R_OK));
+                break;
+
+            case OVERLAY_NONE:
+                fprintf(stderr, "    -> File not found\n");
+                return -ENOENT;
+        }
+
+        if (res == -1) {
+            return -errno;
+        }
+
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
 
     /*
      * Standard access permission flags:
@@ -678,7 +671,7 @@ loopback_access(const char *path, int mask)
      * _CHOWN_OK       change ownership
      */
 
-    res = access(redirected.value, mask & (F_OK | X_OK | W_OK | R_OK));
+    res = access(redirected, mask & (F_OK | X_OK | W_OK | R_OK));
     if (res == -1)
         return -errno;
 
@@ -692,6 +685,11 @@ loopback_readlink(const char *path, char *buf, size_t size)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
+
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "READLINK")) {
+        return -ENOTSUP;
+    }
 
     // Check if this is an overlay filesystem operation
     struct overlay_info overlay = find_overlay_in_tree(context->pid);
@@ -731,14 +729,11 @@ loopback_readlink(const char *path, char *buf, size_t size)
         }
     }
 
-    // Non-overlay path: use standard redirection
-    struct path redirected = apply_wrapper_redirect_with_context(path, "READLINK", context);
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
-    }
-
-    res = readlink(redirected.value, buf, size - 1);
+    res = readlink(redirected, buf, size - 1);
     if (res == -1) {
         return -errno;
     }
@@ -767,8 +762,9 @@ struct overlay_dirp {
 // Function to merge directory entries from upper and lower layers
 static int merge_overlay_directory_entries(const char* original_path, const struct overlay_info* overlay,
                                            char*** entries, int* entry_count) {
-    struct path upper_path_struct = build_redirected_path(original_path, overlay->upper_dir);
-    struct path lower_path_struct = build_redirected_path(original_path, overlay->lower_dir);
+    char upper_path_buf[PATH_MAX], lower_path_buf[PATH_MAX];
+    concatenate_path(original_path, overlay->upper_dir, upper_path_buf);
+    concatenate_path(original_path, overlay->lower_dir, lower_path_buf);
 
     // Whiteout directory path
     char whiteout_path[PATH_MAX];
@@ -779,8 +775,8 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     }
 
     fprintf(stderr, "    Merging directory entries for %s:\n", original_path);
-    fprintf(stderr, "      Upper dir: %s\n", upper_path_struct.value);
-    fprintf(stderr, "      Lower dir: %s\n", lower_path_struct.value);
+    fprintf(stderr, "      Upper dir: %s\n", upper_path_buf);
+    fprintf(stderr, "      Lower dir: %s\n", lower_path_buf);
     fprintf(stderr, "      Whiteout dir: %s\n", whiteout_path);
 
     // Simple implementation: allocate array for up to 1000 entries
@@ -823,7 +819,7 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
 
 
     // First, read upper directory
-    DIR* upper_dp = opendir(upper_path_struct.value);
+    DIR* upper_dp = opendir(upper_path_buf);
     if (upper_dp) {
         struct dirent* entry;
         while ((entry = readdir(upper_dp)) && *entry_count < 1000) {
@@ -845,7 +841,7 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     }
 
     // Then, read lower directory (only add files not in upper and not whiteout)
-    DIR* lower_dp = opendir(lower_path_struct.value);
+    DIR* lower_dp = opendir(lower_path_buf);
     if (lower_dp) {
         struct dirent* entry;
         while ((entry = readdir(lower_dp)) && *entry_count < 1000) {
@@ -969,20 +965,8 @@ static int create_whiteout_marker(const char* original_path, const struct overla
 
     fprintf(stderr, "    Creating whiteout marker: %s\n", whiteout_file);
 
-    // Create whiteout directory if it doesn't exist (mkdir -p equivalent)
-    char temp_dir[PATH_MAX];
-    strncpy(temp_dir, whiteout_dir, sizeof(temp_dir) - 1);
-    temp_dir[sizeof(temp_dir) - 1] = '\0';
-
-    // Simple mkdir -p implementation
-    for (char *p = temp_dir + 1; *p; p++) {
-        if (*p == '/') {
-            *p = '\0';
-            mkdir(temp_dir, 0755);  // Ignore errors - directory might exist
-            *p = '/';
-        }
-    }
-    mkdir(temp_dir, 0755);  // Create final directory
+    // Create whiteout directory if it doesn't exist
+    create_parent_directories(whiteout_file);
 
     // Check if whiteout_file already exists as a directory
     // This happens when we previously deleted files within this directory
@@ -1014,47 +998,47 @@ loopback_opendir(const char *path, struct fuse_file_info *fi)
     int res;
     struct fuse_context *context = fuse_get_context();
 
-    if (context) {
-        // Check for overlay configuration
-        struct overlay_info overlay = find_overlay_in_tree(context->pid);
-        if (overlay.found && strlen(overlay.upper_dir) > 0) {
-            // This is an overlay directory - use merged directory listing
-            struct overlay_dirp *od = malloc(sizeof(struct overlay_dirp));
-            if (od == NULL) {
-                return -ENOMEM;
-            }
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "OPENDIR")) {
+        return -ENOTSUP;
+    }
 
-            od->is_overlay = true;
-            od->overlay_info = overlay;
-            od->current_index = 0;
-            strncpy(od->original_path, path, sizeof(od->original_path) - 1);
-            od->original_path[sizeof(od->original_path) - 1] = '\0';
-
-            // Merge directory entries from upper and lower layers
-            res = merge_overlay_directory_entries(path, &overlay, &od->merged_entries, &od->entry_count);
-            if (res < 0) {
-                free(od);
-                return res;
-            }
-
-            fi->fh = (unsigned long)od;
-            return 0;
+    // Check for overlay configuration
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found && strlen(overlay.upper_dir) > 0) {
+        // This is an overlay directory - use merged directory listing
+        struct overlay_dirp *od = malloc(sizeof(struct overlay_dirp));
+        if (od == NULL) {
+            return -ENOMEM;
         }
+
+        od->is_overlay = true;
+        od->overlay_info = overlay;
+        od->current_index = 0;
+        strncpy(od->original_path, path, sizeof(od->original_path) - 1);
+        od->original_path[sizeof(od->original_path) - 1] = '\0';
+
+        // Merge directory entries from upper and lower layers
+        res = merge_overlay_directory_entries(path, &overlay, &od->merged_entries, &od->entry_count);
+        if (res < 0) {
+            free(od);
+            return res;
+        }
+
+        fi->fh = (unsigned long)od;
+        return 0;
     }
 
     // Fall back to regular directory handling
-    struct path redirected = apply_wrapper_redirect_with_context(path, "OPENDIR", context);
-
-    if (redirected.fail) {
-        return -redirected.error_code;
-    }
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
 
     struct loopback_dirp *d = malloc(sizeof(struct loopback_dirp));
     if (d == NULL) {
         return -ENOMEM;
     }
 
-    d->dp = opendir(redirected.value);
+    d->dp = opendir(redirected);
     if (d->dp == NULL) {
         res = -errno;
         free(d);
@@ -1123,11 +1107,9 @@ loopback_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
             }
 
             // Use our overlay logic to find the file and get its stats
-            struct fuse_context *context = fuse_get_context();
-            struct path redirected = apply_wrapper_redirect_with_context(full_path, "READDIR_STAT", context);
-            if (!redirected.fail) {
-                lstat(redirected.value, &st);
-            }
+            char redirected[PATH_MAX];
+            get_passthrough_path(full_path, redirected);
+            lstat(redirected, &st);
 
             off_t nextoff = i + 3;  // +3 for ., .., and 0-based index
             if (filler(buf, od->merged_entries[i], &st, nextoff)) {
@@ -1225,16 +1207,57 @@ loopback_mknod(const char *path, mode_t mode, dev_t rdev)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected = apply_wrapper_redirect_with_context(path, "MKNOD", context);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "MKNOD")) {
+        return -ENOTSUP;
     }
 
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** MKNOD OVERLAY: %s (mode=%o) ***\n", path, mode);
+
+        // Special files are always created in upper layer (write operation)
+        char upper_path[PATH_MAX];
+        concatenate_path(path, overlay.upper_dir, upper_path);
+
+        fprintf(stderr, "    -> Creating special file in UPPER: %s\n", upper_path);
+
+        // Create parent directories in upper layer if needed
+        create_parent_directories(upper_path);
+
+        // Create the special file in upper layer
+        if (S_ISFIFO(mode)) {
+            res = mkfifo(upper_path, mode);
+        } else {
+            res = mknod(upper_path, mode, rdev);
+        }
+
+        if (res == -1) {
+            fprintf(stderr, "    -> Failed to create special file: %s\n", strerror(errno));
+            return -errno;
+        }
+
+        // Set proper ownership to the calling user
+        if (context && chown(upper_path, context->uid, context->gid) == -1) {
+            fprintf(stderr, "    Warning: Failed to set ownership for %s: %s\n", upper_path, strerror(errno));
+        }
+
+        // If there's a whiteout marker, remove it since we're creating a real file
+        remove_whiteout_marker(overlay.upper_dir, path);
+
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
+
     if (S_ISFIFO(mode)) {
-        res = mkfifo(redirected.value, mode);
+        res = mkfifo(redirected, mode);
     } else {
-        res = mknod(redirected.value, mode, rdev);
+        res = mknod(redirected, mode, rdev);
     }
 
     if (res == -1) {
@@ -1242,8 +1265,8 @@ loopback_mknod(const char *path, mode_t mode, dev_t rdev)
     }
 
     // Set proper ownership to the calling user
-    if (context && chown(redirected.value, context->uid, context->gid) == -1) {
-        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", redirected.value, strerror(errno));
+    if (context && chown(redirected, context->uid, context->gid) == -1) {
+        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", redirected, strerror(errno));
     }
 
     return 0;
@@ -1254,20 +1277,56 @@ loopback_mkdir(const char *path, mode_t mode)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected = apply_wrapper_redirect_with_context(path, "MKDIR", context);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "MKDIR")) {
+        return -ENOTSUP;
     }
 
-    res = mkdir(redirected.value, mode);
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** MKDIR OVERLAY: %s ***\n", path);
+
+        // Directories are always created in upper layer (write operation)
+        char upper_path[PATH_MAX];
+        concatenate_path(path, overlay.upper_dir, upper_path);
+
+        fprintf(stderr, "    -> Creating directory in UPPER: %s\n", upper_path);
+
+        // Create parent directories in upper layer if needed
+        create_parent_directories(upper_path);
+
+        // Create the directory in upper layer
+        res = mkdir(upper_path, mode);
+        if (res == -1) {
+            fprintf(stderr, "    -> Failed to create directory: %s\n", strerror(errno));
+            return -errno;
+        }
+
+        // Set proper ownership to the calling user
+        if (context && chown(upper_path, context->uid, context->gid) == -1) {
+            fprintf(stderr, "    Warning: Failed to set ownership for %s: %s\n", upper_path, strerror(errno));
+        }
+
+        // If there's a whiteout marker, remove it since we're creating a real directory
+        remove_whiteout_marker(overlay.upper_dir, path);
+
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
+
+    res = mkdir(redirected, mode);
     if (res == -1) {
         return -errno;
     }
 
     // Set proper ownership to the calling user
-    if (context && chown(redirected.value, context->uid, context->gid) == -1) {
-        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", redirected.value, strerror(errno));
+    if (context && chown(redirected, context->uid, context->gid) == -1) {
+        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", redirected, strerror(errno));
     }
 
     return 0;
@@ -1279,56 +1338,56 @@ loopback_unlink(const char *path)
     int res;
     struct fuse_context *context = fuse_get_context();
 
-    if (context) {
-        // Check for overlay configuration
-        struct overlay_info overlay = find_overlay_in_tree(context->pid);
-        if (overlay.found && strlen(overlay.upper_dir) > 0) {
-            // This is an overlay filesystem - use overlay delete logic
-            char upper_path[PATH_MAX], lower_path[PATH_MAX];
-            overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "UNLINK")) {
+        return -ENOTSUP;
+    }
 
-            switch (location) {
-                case OVERLAY_WHITEOUT:
-                    // File already deleted (whiteout exists)
-                    fprintf(stderr, "*** UNLINK OVERLAY: %s already whiteout (deleted) ***\n", path);
-                    return -ENOENT;
+    // Check for overlay configuration
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found && strlen(overlay.upper_dir) > 0) {
+        // This is an overlay filesystem - use overlay delete logic
+        char upper_path[PATH_MAX], lower_path[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
 
-                case OVERLAY_UPPER:
-                    // File exists in upper layer - delete it normally
-                    {
-                        fprintf(stderr, "*** UNLINK OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path);
-                        res = unlink(upper_path);
-                        if (res == -1) {
-                            return -errno;
-                        }
-                        return 0;
-                    }
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                // File already deleted (whiteout exists)
+                fprintf(stderr, "*** UNLINK OVERLAY: %s already whiteout (deleted) ***\n", path);
+                return -ENOENT;
 
-                case OVERLAY_LOWER:
-                    // File exists only in lower layer - create whiteout marker
-                    fprintf(stderr, "*** UNLINK OVERLAY LOWER: %s -> create whiteout ***\n", path);
-                    res = create_whiteout_marker(path, &overlay);
-                    if (res < 0) {
-                        return res;
+            case OVERLAY_UPPER:
+                // File exists in upper layer - delete it normally
+                {
+                    fprintf(stderr, "*** UNLINK OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path);
+                    res = unlink(upper_path);
+                    if (res == -1) {
+                        return -errno;
                     }
                     return 0;
+                }
 
-                case OVERLAY_NONE:
-                    // File doesn't exist anywhere
-                    fprintf(stderr, "*** UNLINK OVERLAY NONE: %s does not exist ***\n", path);
-                    return -ENOENT;
-            }
+            case OVERLAY_LOWER:
+                // File exists only in lower layer - create whiteout marker
+                fprintf(stderr, "*** UNLINK OVERLAY LOWER: %s -> create whiteout ***\n", path);
+                res = create_whiteout_marker(path, &overlay);
+                if (res < 0) {
+                    return res;
+                }
+                return 0;
+
+            case OVERLAY_NONE:
+                // File doesn't exist anywhere
+                fprintf(stderr, "*** UNLINK OVERLAY NONE: %s does not exist ***\n", path);
+                return -ENOENT;
         }
     }
 
     // Fall back to regular unlink
-    struct path redirected = apply_wrapper_redirect_with_context(path, "UNLINK", context);
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
-    }
-
-    res = unlink(redirected.value);
+    res = unlink(redirected);
     if (res == -1) {
         return -errno;
     }
@@ -1342,56 +1401,56 @@ loopback_rmdir(const char *path)
     int res;
     struct fuse_context *context = fuse_get_context();
 
-    if (context) {
-        // Check for overlay configuration
-        struct overlay_info overlay = find_overlay_in_tree(context->pid);
-        if (overlay.found && strlen(overlay.upper_dir) > 0) {
-            // This is an overlay filesystem - use overlay delete logic
-            char upper_path[PATH_MAX], lower_path[PATH_MAX];
-            overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "RMDIR")) {
+        return -ENOTSUP;
+    }
 
-            switch (location) {
-                case OVERLAY_WHITEOUT:
-                    // Directory already deleted (whiteout exists)
-                    fprintf(stderr, "*** RMDIR OVERLAY: %s already whiteout (deleted) ***\n", path);
-                    return -ENOENT;
+    // Check for overlay configuration
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found && strlen(overlay.upper_dir) > 0) {
+        // This is an overlay filesystem - use overlay delete logic
+        char upper_path[PATH_MAX], lower_path[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
 
-                case OVERLAY_UPPER:
-                    // Directory exists in upper layer - delete it normally
-                    {
-                        fprintf(stderr, "*** RMDIR OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path);
-                        res = rmdir(upper_path);
-                        if (res == -1) {
-                            return -errno;
-                        }
-                        return 0;
-                    }
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                // Directory already deleted (whiteout exists)
+                fprintf(stderr, "*** RMDIR OVERLAY: %s already whiteout (deleted) ***\n", path);
+                return -ENOENT;
 
-                case OVERLAY_LOWER:
-                    // Directory exists only in lower layer - create whiteout marker
-                    fprintf(stderr, "*** RMDIR OVERLAY LOWER: %s -> create whiteout ***\n", path);
-                    res = create_whiteout_marker(path, &overlay);
-                    if (res < 0) {
-                        return res;
+            case OVERLAY_UPPER:
+                // Directory exists in upper layer - delete it normally
+                {
+                    fprintf(stderr, "*** RMDIR OVERLAY UPPER: %s -> delete %s ***\n", path, upper_path);
+                    res = rmdir(upper_path);
+                    if (res == -1) {
+                        return -errno;
                     }
                     return 0;
+                }
 
-                case OVERLAY_NONE:
-                    // Directory doesn't exist anywhere
-                    fprintf(stderr, "*** RMDIR OVERLAY NONE: %s does not exist ***\n", path);
-                    return -ENOENT;
-            }
+            case OVERLAY_LOWER:
+                // Directory exists only in lower layer - create whiteout marker
+                fprintf(stderr, "*** RMDIR OVERLAY LOWER: %s -> create whiteout ***\n", path);
+                res = create_whiteout_marker(path, &overlay);
+                if (res < 0) {
+                    return res;
+                }
+                return 0;
+
+            case OVERLAY_NONE:
+                // Directory doesn't exist anywhere
+                fprintf(stderr, "*** RMDIR OVERLAY NONE: %s does not exist ***\n", path);
+                return -ENOENT;
         }
     }
 
     // Fall back to regular rmdir
-    struct path redirected = apply_wrapper_redirect_with_context(path, "RMDIR", context);
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
-    }
-
-    res = rmdir(redirected.value);
+    res = rmdir(redirected);
     if (res == -1) {
         return -errno;
     }
@@ -1404,6 +1463,11 @@ loopback_symlink(const char *from, const char *to)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
+
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "SYMLINK")) {
+        return -ENOTSUP;
+    }
 
     // Check if this is an overlay filesystem operation
     struct overlay_info overlay = find_overlay_in_tree(context->pid);
@@ -1432,26 +1496,16 @@ loopback_symlink(const char *from, const char *to)
         }
 
         // If there's a whiteout marker, remove it since we're creating a real file
-        char whiteout_path[PATH_MAX];
-        snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted%s",
-                overlay.upper_dir, to);
-        struct stat st;
-        if (lstat(whiteout_path, &st) == 0 && S_ISREG(st.st_mode)) {
-            fprintf(stderr, "    -> Removing whiteout marker: %s\n", whiteout_path);
-            unlink(whiteout_path);
-        }
+        remove_whiteout_marker(overlay.upper_dir, to);
 
         return 0;
     }
 
-    // Non-overlay path: use standard redirection
-    struct path redirected = apply_wrapper_redirect_with_context(to, "SYMLINK", context);
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(to, redirected);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
-    }
-
-    res = symlink(from, redirected.value);
+    res = symlink(from, redirected);
     if (res == -1) {
         return -errno;
     }
@@ -1464,14 +1518,69 @@ loopback_rename(const char *from, const char *to)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected_from = apply_wrapper_redirect_with_context(from, "RENAME1", context);
-    struct path redirected_to = apply_wrapper_redirect_with_context(to, "RENAME2", context);
 
-    if (redirected_from.fail || redirected_to.fail) {
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "RENAME")) {
         return -ENOTSUP;
     }
 
-    res = rename(redirected_from.value, redirected_to.value);
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** RENAME OVERLAY: %s -> %s ***\n", from, to);
+
+        // Find locations of source and destination
+        char from_upper[PATH_MAX], from_lower[PATH_MAX];
+        char to_upper[PATH_MAX], to_lower[PATH_MAX];
+        overlay_location_t from_loc = find_overlay_file_location(from, &overlay, from_upper, from_lower);
+        overlay_location_t to_loc = find_overlay_file_location(to, &overlay, to_upper, to_lower);
+
+        // Check if source exists
+        if (from_loc == OVERLAY_WHITEOUT || from_loc == OVERLAY_NONE) {
+            fprintf(stderr, "    -> Source file does not exist\n");
+            return -ENOENT;
+        }
+
+        // Handle source file based on its location
+        if (from_loc == OVERLAY_LOWER) {
+            fprintf(stderr, "    -> Source is in LOWER, copying to UPPER at new location\n");
+            create_parent_directories(to_upper);
+            if (copy_file_to_upper(from_lower, to_upper) != 0) {
+                fprintf(stderr, "    -> Failed to copy source to upper\n");
+                return -EIO;
+            }
+
+            // Create whiteout marker at old location (to hide lower file)
+            create_whiteout_marker(from, &overlay);
+        } else {
+            // Source is in upper - perform normal rename
+            fprintf(stderr, "    -> Source is in UPPER, renaming\n");
+            create_parent_directories(to_upper);
+            res = rename(from_upper, to_upper);
+            if (res == -1) {
+                fprintf(stderr, "    -> Rename failed: %s\n", strerror(errno));
+                return -errno;
+            }
+        }
+
+        // If destination exists in lower layer, create whiteout marker
+        if (to_loc == OVERLAY_LOWER) {
+            fprintf(stderr, "    -> Destination exists in LOWER, will be hidden by new file\n");
+        }
+
+        // Remove any whiteout marker at destination
+        remove_whiteout_marker(overlay.upper_dir, to);
+
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected_from[PATH_MAX];
+    char redirected_to[PATH_MAX];
+    get_passthrough_path(from, redirected_from);
+    get_passthrough_path(to, redirected_to);
+
+    res = rename(redirected_from, redirected_to);
     if (res == -1) {
         return -errno;
     }
@@ -1486,14 +1595,75 @@ loopback_exchange(const char *path1, const char *path2, unsigned long options)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected1 = apply_wrapper_redirect_with_context(path1, "EXCHANGE1", context);
-    struct path redirected2 = apply_wrapper_redirect_with_context(path2, "EXCHANGE2", context);
 
-    if (redirected1.fail || redirected2.fail) {
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "EXCHANGE")) {
         return -ENOTSUP;
     }
 
-    res = exchangedata(redirected1.value, redirected2.value, options);
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** EXCHANGE OVERLAY: %s <-> %s ***\n", path1, path2);
+
+        // Find locations of both files
+        char path1_upper[PATH_MAX], path1_lower[PATH_MAX];
+        char path2_upper[PATH_MAX], path2_lower[PATH_MAX];
+        overlay_location_t loc1 = find_overlay_file_location(path1, &overlay, path1_upper, path1_lower);
+        overlay_location_t loc2 = find_overlay_file_location(path2, &overlay, path2_upper, path2_lower);
+
+        // Check if files exist
+        if (loc1 == OVERLAY_WHITEOUT || loc1 == OVERLAY_NONE) {
+            fprintf(stderr, "    -> path1 does not exist\n");
+            return -ENOENT;
+        }
+        if (loc2 == OVERLAY_WHITEOUT || loc2 == OVERLAY_NONE) {
+            fprintf(stderr, "    -> path2 does not exist\n");
+            return -ENOENT;
+        }
+
+        // Copy up path1 if needed
+        if (loc1 == OVERLAY_LOWER) {
+            fprintf(stderr, "    -> Copying up path1 from LOWER to UPPER\n");
+            create_parent_directories(path1_upper);
+            if (copy_file_to_upper(path1_lower, path1_upper) != 0) {
+                fprintf(stderr, "    -> Failed to copy up path1\n");
+                return -EIO;
+            }
+        }
+
+        // Copy up path2 if needed
+        if (loc2 == OVERLAY_LOWER) {
+            fprintf(stderr, "    -> Copying up path2 from LOWER to UPPER\n");
+            create_parent_directories(path2_upper);
+            if (copy_file_to_upper(path2_lower, path2_upper) != 0) {
+                fprintf(stderr, "    -> Failed to copy up path2\n");
+                return -EIO;
+            }
+        }
+
+        // Both files are now in upper layer - perform the exchange
+        fprintf(stderr, "    -> Exchanging files in UPPER layer\n");
+        res = exchangedata(path1_upper, path2_upper, options);
+        if (res == -1) {
+            fprintf(stderr, "    -> Exchange failed: %s\n", strerror(errno));
+            return -errno;
+        }
+
+        // Remove any whiteout markers
+        remove_whiteout_marker(overlay.upper_dir, path1);
+        remove_whiteout_marker(overlay.upper_dir, path2);
+
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected1[PATH_MAX];
+    char redirected2[PATH_MAX];
+    get_passthrough_path(path1, redirected1);
+    get_passthrough_path(path2, redirected2);
+
+    res = exchangedata(redirected1, redirected2, options);
     if (res == -1) {
         return -errno;
     }
@@ -1508,6 +1678,11 @@ loopback_link(const char *from, const char *to)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
+
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "LINK")) {
+        return -ENOTSUP;
+    }
 
     // Check if this is an overlay filesystem operation
     struct overlay_info overlay = find_overlay_in_tree(context->pid);
@@ -1538,13 +1713,11 @@ loopback_link(const char *from, const char *to)
         }
 
         // Destination is always in upper layer (write operation)
-        struct path to_upper_path = build_redirected_path(to, overlay.upper_dir);
-        if (to_upper_path.fail) {
-            return -to_upper_path.error_code;
-        }
+        char to_upper_path[PATH_MAX];
+        concatenate_path(to, overlay.upper_dir, to_upper_path);
 
         // Create parent directories in upper layer if needed
-        create_parent_directories(to_upper_path.value);
+        create_parent_directories(to_upper_path);
 
         // If source is in lower layer, we need to copy it to upper first
         // (can't create hard links across different filesystems)
@@ -1553,12 +1726,7 @@ loopback_link(const char *from, const char *to)
 
         if (from_location == OVERLAY_LOWER) {
             fprintf(stderr, "    -> Source in LOWER, copying to UPPER first\n");
-            struct path from_upper = build_redirected_path(from, overlay.upper_dir);
-            if (from_upper.fail) {
-                return -from_upper.error_code;
-            }
-            strncpy(from_upper_path_buf, from_upper.value, sizeof(from_upper_path_buf) - 1);
-            from_upper_path_buf[sizeof(from_upper_path_buf) - 1] = '\0';
+            concatenate_path(from, overlay.upper_dir, from_upper_path_buf);
 
             // Copy the file from lower to upper (breaking any existing hard links)
             res = copy_file_to_upper(from_real_path, from_upper_path_buf);
@@ -1575,21 +1743,14 @@ loopback_link(const char *from, const char *to)
         }
 
         // Create the hard link in upper layer
-        res = link(from_link_path, to_upper_path.value);
+        res = link(from_link_path, to_upper_path);
         if (res == -1) {
             fprintf(stderr, "    -> Failed to create hard link: %s\n", strerror(errno));
             return -errno;
         }
 
         // If there's a whiteout marker for 'to', remove it
-        char whiteout_path[PATH_MAX];
-        snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted%s",
-                overlay.upper_dir, to);
-        struct stat st;
-        if (lstat(whiteout_path, &st) == 0 && S_ISREG(st.st_mode)) {
-            fprintf(stderr, "    -> Removing whiteout marker: %s\n", whiteout_path);
-            unlink(whiteout_path);
-        }
+        remove_whiteout_marker(overlay.upper_dir, to);
 
         fprintf(stderr, "    -> Hard link created successfully\n");
         return 0;
@@ -1611,6 +1772,12 @@ loopback_fsetattr_x(const char *path, struct setattr_x *attr,
     int res;
     uid_t uid = -1;
     gid_t gid = -1;
+    struct fuse_context *context = fuse_get_context();
+
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "FSETATTR_X")) {
+        return -ENOTSUP;
+    }
 
     if (SETATTR_WANTS_MODE(attr)) {
         res = fchmod(fi->fh, attr->mode);
@@ -1731,6 +1898,11 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
     uid_t uid = -1;
     gid_t gid = -1;
     struct fuse_context *context = fuse_get_context();
+
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "SETATTR_X")) {
+        return -ENOTSUP;
+    }
 
     // Check if this is an overlay filesystem operation
     struct overlay_info overlay = find_overlay_in_tree(context->pid);
@@ -1883,15 +2055,12 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
         return 0;
     }
 
-    // Non-overlay path: use standard redirection
-    struct path redirected = apply_wrapper_redirect_with_context(path, "SETATTR_X", context);
-
-    if (redirected.fail) {
-        return -redirected.error_code;
-    }
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
 
     if (SETATTR_WANTS_MODE(attr)) {
-        res = lchmod(redirected.value, attr->mode);
+        res = lchmod(redirected, attr->mode);
         if (res == -1) {
             return -errno;
         }
@@ -1906,14 +2075,14 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
     }
 
     if ((uid != -1) || (gid != -1)) {
-        res = lchown(redirected.value, uid, gid);
+        res = lchown(redirected, uid, gid);
         if (res == -1) {
             return -errno;
         }
     }
 
     if (SETATTR_WANTS_SIZE(attr)) {
-        res = truncate(redirected.value, attr->size);
+        res = truncate(redirected, attr->size);
         if (res == -1) {
             return -errno;
         }
@@ -1929,7 +2098,7 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
         }
         tv[1].tv_sec = attr->modtime.tv_sec;
         tv[1].tv_usec = attr->modtime.tv_nsec / 1000;
-        res = lutimes(redirected.value, tv);
+        res = lutimes(redirected, tv);
         if (res == -1) {
             return -errno;
         }
@@ -1946,7 +2115,7 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
         attributes.forkattr = 0;
         attributes.volattr = 0;
 
-        res = setattrlist(redirected.value, &attributes, &attr->crtime,
+        res = setattrlist(redirected, &attributes, &attr->crtime,
                           sizeof(struct timespec), FSOPT_NOFOLLOW);
 
         if (res == -1) {
@@ -1965,7 +2134,7 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
         attributes.forkattr = 0;
         attributes.volattr = 0;
 
-        res = setattrlist(redirected.value, &attributes, &attr->chgtime,
+        res = setattrlist(redirected, &attributes, &attr->chgtime,
                           sizeof(struct timespec), FSOPT_NOFOLLOW);
 
         if (res == -1) {
@@ -1984,7 +2153,7 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
         attributes.forkattr = 0;
         attributes.volattr = 0;
 
-        res = setattrlist(redirected.value, &attributes, &attr->bkuptime,
+        res = setattrlist(redirected, &attributes, &attr->bkuptime,
                           sizeof(struct timespec), FSOPT_NOFOLLOW);
 
         if (res == -1) {
@@ -1993,7 +2162,7 @@ loopback_setattr_x(const char *path, struct setattr_x *attr)
     }
 
     if (SETATTR_WANTS_FLAGS(attr)) {
-        res = lchflags(redirected.value, attr->flags);
+        res = lchflags(redirected, attr->flags);
         if (res == -1) {
             return -errno;
         }
@@ -2009,10 +2178,10 @@ loopback_getxtimes(const char *path, struct timespec *bkuptime,
     int res = 0;
     struct attrlist attributes;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected = apply_wrapper_redirect_with_context(path, "GETXTIMES", context);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "GETXTIMES")) {
+        return -ENOTSUP;
     }
 
     attributes.bitmapcount = ATTR_BIT_MAP_COUNT;
@@ -2030,8 +2199,61 @@ loopback_getxtimes(const char *path, struct timespec *bkuptime,
 
     struct xtimeattrbuf buf;
 
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** GETXTIMES OVERLAY: %s ***\n", path);
+
+        // Find the file location in overlay
+        char upper_path[PATH_MAX], lower_path[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
+
+        const char *target_path;
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                fprintf(stderr, "    -> File is whiteout (deleted)\n");
+                return -ENOENT;
+
+            case OVERLAY_UPPER:
+                fprintf(stderr, "    -> Reading xtimes from UPPER: %s\n", upper_path);
+                target_path = upper_path;
+                break;
+
+            case OVERLAY_LOWER:
+                fprintf(stderr, "    -> Reading xtimes from LOWER: %s\n", lower_path);
+                target_path = lower_path;
+                break;
+
+            case OVERLAY_NONE:
+                fprintf(stderr, "    -> File not found\n");
+                return -ENOENT;
+        }
+
+        attributes.commonattr = ATTR_CMN_BKUPTIME;
+        res = getattrlist(target_path, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
+        if (res == 0) {
+            (void)memcpy(bkuptime, &(buf.xtime), sizeof(struct timespec));
+        } else {
+            (void)memset(bkuptime, 0, sizeof(struct timespec));
+        }
+
+        attributes.commonattr = ATTR_CMN_CRTIME;
+        res = getattrlist(target_path, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
+        if (res == 0) {
+            (void)memcpy(crtime, &(buf.xtime), sizeof(struct timespec));
+        } else {
+            (void)memset(crtime, 0, sizeof(struct timespec));
+        }
+
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
+
     attributes.commonattr = ATTR_CMN_BKUPTIME;
-    res = getattrlist(redirected.value, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
+    res = getattrlist(redirected, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
     if (res == 0) {
         (void)memcpy(bkuptime, &(buf.xtime), sizeof(struct timespec));
     } else {
@@ -2039,7 +2261,7 @@ loopback_getxtimes(const char *path, struct timespec *bkuptime,
     }
 
     attributes.commonattr = ATTR_CMN_CRTIME;
-    res = getattrlist(redirected.value, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
+    res = getattrlist(redirected, &attributes, &buf, sizeof(buf), FSOPT_NOFOLLOW);
     if (res == 0) {
         (void)memcpy(crtime, &(buf.xtime), sizeof(struct timespec));
     } else {
@@ -2125,20 +2347,57 @@ loopback_create(const char *path, mode_t mode, struct fuse_file_info *fi)
 {
     int fd;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected = apply_wrapper_redirect_with_context(path, "CREATE", context);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "CREATE")) {
+        return -ENOTSUP;
     }
 
-    fd = open(redirected.value, fi->flags, mode);
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** CREATE OVERLAY: %s ***\n", path);
+
+        // New files are always created in upper layer (write operation)
+        char upper_path[PATH_MAX];
+        concatenate_path(path, overlay.upper_dir, upper_path);
+
+        fprintf(stderr, "    -> Creating file in UPPER: %s\n", upper_path);
+
+        // Create parent directories in upper layer if needed
+        create_parent_directories(upper_path);
+
+        // Create the file in upper layer
+        fd = open(upper_path, fi->flags, mode);
+        if (fd == -1) {
+            fprintf(stderr, "    -> Failed to create file: %s\n", strerror(errno));
+            return -errno;
+        }
+
+        // Set proper ownership to the calling user
+        if (context && fchown(fd, context->uid, context->gid) == -1) {
+            fprintf(stderr, "    Warning: Failed to set ownership for %s: %s\n", upper_path, strerror(errno));
+        }
+
+        // If there's a whiteout marker, remove it since we're creating a real file
+        remove_whiteout_marker(overlay.upper_dir, path);
+
+        fi->fh = fd;
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
+
+    fd = open(redirected, fi->flags, mode);
     if (fd == -1) {
         return -errno;
     }
 
     // Set proper ownership to the calling user
     if (context && fchown(fd, context->uid, context->gid) == -1) {
-        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", redirected.value, strerror(errno));
+        fprintf(stderr, "Warning: Failed to set ownership for %s: %s\n", redirected, strerror(errno));
     }
 
     fi->fh = fd;
@@ -2151,66 +2410,82 @@ loopback_open(const char *path, struct fuse_file_info *fi)
     int fd;
     struct fuse_context *context = fuse_get_context();
 
-    // Check if this is an overlay filesystem and if we're opening for write
-    if (context) {
-        struct overlay_info overlay = find_overlay_in_tree(context->pid);
-        if (overlay.found && strlen(overlay.upper_dir) > 0) {
-            // Check if file needs write access
-            bool needs_write = (fi->flags & (O_WRONLY | O_RDWR | O_APPEND | O_TRUNC)) != 0;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "OPEN")) {
+        return -ENOTSUP;
+    }
 
-            if (needs_write) {
-                // Find where the file currently exists
-                char upper_path_buf[PATH_MAX], lower_path_buf[PATH_MAX];
-                overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path_buf, lower_path_buf);
+    // Check if this is an overlay filesystem
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found && strlen(overlay.upper_dir) > 0) {
+        // Check if file needs write access
+        bool needs_write = (fi->flags & (O_WRONLY | O_RDWR | O_APPEND | O_TRUNC)) != 0;
 
-                switch (location) {
-                    case OVERLAY_WHITEOUT:
-                        // File is deleted
-                        return -ENOENT;
+        // Find where the file currently exists
+        char upper_path_buf[PATH_MAX], lower_path_buf[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path_buf, lower_path_buf);
 
-                    case OVERLAY_LOWER:
-                        // File exists only in lower layer and we're opening for write
-                        // Need to copy it to upper layer first (copy-on-write)
-                        fprintf(stderr, "*** OPEN COPY-ON-WRITE: %s in lower, copying to upper %s ***\n",
-                                path, upper_path_buf);
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                // File is deleted
+                fprintf(stderr, "*** OPEN: %s is whiteout (deleted) ***\n", path);
+                return -ENOENT;
 
-                        int res = copy_file_to_upper(lower_path_buf, upper_path_buf);
-                        if (res < 0) {
-                            return res;
-                        }
+            case OVERLAY_LOWER:
+                if (needs_write) {
+                    // File exists only in lower layer and we're opening for write
+                    // Need to copy it to upper layer first (copy-on-write)
+                    fprintf(stderr, "*** OPEN COPY-ON-WRITE: %s in lower, copying to upper %s ***\n",
+                            path, upper_path_buf);
 
-                        // Now open the upper layer copy
-                        fd = open(upper_path_buf, fi->flags);
-                        if (fd == -1) {
-                            return -errno;
-                        }
+                    int res = copy_file_to_upper(lower_path_buf, upper_path_buf);
+                    if (res < 0) {
+                        return res;
+                    }
 
-                        fi->fh = fd;
-                        return 0;
+                    // Now open the upper layer copy
+                    fd = open(upper_path_buf, fi->flags);
+                    if (fd == -1) {
+                        return -errno;
+                    }
 
-                    case OVERLAY_UPPER:
-                    case OVERLAY_NONE:
-                        // File in upper or doesn't exist - use normal path resolution
-                        fd = open(upper_path_buf, fi->flags);
-                        if (fd == -1) {
-                            return -errno;
-                        }
+                    fi->fh = fd;
+                    return 0;
+                } else {
+                    // Read-only access - open from lower layer
+                    fprintf(stderr, "*** OPEN READ: %s from LOWER: %s ***\n", path, lower_path_buf);
+                    fd = open(lower_path_buf, fi->flags);
+                    if (fd == -1) {
+                        return -errno;
+                    }
 
-                        fi->fh = fd;
-                        return 0;
+                    fi->fh = fd;
+                    return 0;
                 }
-            }
+
+            case OVERLAY_UPPER:
+                // File in upper layer
+                fprintf(stderr, "*** OPEN: %s from UPPER: %s ***\n", path, upper_path_buf);
+                fd = open(upper_path_buf, fi->flags);
+                if (fd == -1) {
+                    return -errno;
+                }
+
+                fi->fh = fd;
+                return 0;
+
+            case OVERLAY_NONE:
+                // File doesn't exist
+                fprintf(stderr, "*** OPEN: %s not found in overlay ***\n", path);
+                return -ENOENT;
         }
     }
 
     // Fall back to regular open logic (no overlay or read-only access)
-    struct path redirected = apply_wrapper_redirect_with_context(path, "OPEN", context);
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
-    }
-
-    fd = open(redirected.value, fi->flags);
+    fd = open(redirected, fi->flags);
     if (fd == -1) {
         return -errno;
     }
@@ -2298,20 +2573,77 @@ loopback_setxattr(const char *path, const char *name, const char *value,
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected = apply_wrapper_redirect_with_context(path, "SETXATTR", context);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "SETXATTR")) {
+        return -ENOTSUP;
     }
+
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** SETXATTR OVERLAY: %s (name=%s) ***\n", path, name);
+
+        // Find the file location in overlay
+        char upper_path_buf[PATH_MAX], lower_path_buf[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path_buf, lower_path_buf);
+
+        const char *target_path;
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                fprintf(stderr, "    -> File is whiteout (deleted)\n");
+                return -ENOENT;
+
+            case OVERLAY_NONE:
+                fprintf(stderr, "    -> File does not exist\n");
+                return -ENOENT;
+
+            case OVERLAY_LOWER:
+                // File is in lower layer - copy it up first (OverlayFS semantics)
+                fprintf(stderr, "    -> File in LOWER, copying to UPPER before setxattr\n");
+                res = copy_file_to_upper(lower_path_buf, upper_path_buf);
+                if (res < 0) {
+                    fprintf(stderr, "    -> Failed to copy file to upper: %d\n", res);
+                    return res;
+                }
+                target_path = upper_path_buf;
+                break;
+
+            case OVERLAY_UPPER:
+                // File already in upper layer
+                fprintf(stderr, "    -> Setting xattr on UPPER: %s\n", upper_path_buf);
+                target_path = upper_path_buf;
+                break;
+        }
+
+        flags |= XATTR_NOFOLLOW;
+        if (strncmp(name, "com.apple.", 10) == 0) {
+            char new_name[MAXPATHLEN] = "org.apple.";
+            strncpy(new_name + 10, name + 10, sizeof(new_name) - 10);
+            res = setxattr(target_path, new_name, value, size, position, flags);
+        } else {
+            res = setxattr(target_path, name, value, size, position, flags);
+        }
+
+        if (res == -1) {
+            return -errno;
+        }
+
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
 
     flags |= XATTR_NOFOLLOW;
     if (strncmp(name, "com.apple.", 10) == 0) {
         char new_name[MAXPATHLEN] = "org.apple.";
         strncpy(new_name + 10, name + 10, sizeof(new_name) - 10);
 
-        res = setxattr(redirected.value, new_name, value, size, position, flags);
+        res = setxattr(redirected, new_name, value, size, position, flags);
     } else {
-        res = setxattr(redirected.value, name, value, size, position, flags);
+        res = setxattr(redirected, name, value, size, position, flags);
     }
 
     if (res == -1) {
@@ -2327,19 +2659,68 @@ loopback_getxattr(const char *path, const char *name, char *value, size_t size,
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected = apply_wrapper_redirect_with_context(path, "GETXATTR", context);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "GETXATTR")) {
+        return -ENOTSUP;
     }
+
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** GETXATTR OVERLAY: %s (name=%s) ***\n", path, name);
+
+        // Find the file location in overlay
+        char upper_path[PATH_MAX], lower_path[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
+
+        const char *target_path;
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                fprintf(stderr, "    -> File is whiteout (deleted)\n");
+                return -ENOENT;
+
+            case OVERLAY_UPPER:
+                fprintf(stderr, "    -> Reading xattr from UPPER: %s\n", upper_path);
+                target_path = upper_path;
+                break;
+
+            case OVERLAY_LOWER:
+                fprintf(stderr, "    -> Reading xattr from LOWER: %s\n", lower_path);
+                target_path = lower_path;
+                break;
+
+            case OVERLAY_NONE:
+                fprintf(stderr, "    -> File not found\n");
+                return -ENOENT;
+        }
+
+        if (strncmp(name, "com.apple.", 10) == 0) {
+            char new_name[MAXPATHLEN] = "org.apple.";
+            strncpy(new_name + 10, name + 10, sizeof(new_name) - 10);
+            res = getxattr(target_path, new_name, value, size, position, XATTR_NOFOLLOW);
+        } else {
+            res = getxattr(target_path, name, value, size, position, XATTR_NOFOLLOW);
+        }
+
+        if (res == -1) {
+            return -errno;
+        }
+
+        return res;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
 
     if (strncmp(name, "com.apple.", 10) == 0) {
         char new_name[MAXPATHLEN] = "org.apple.";
         strncpy(new_name + 10, name + 10, sizeof(new_name) - 10);
 
-        res = getxattr(redirected.value, new_name, value, size, position, XATTR_NOFOLLOW);
+        res = getxattr(redirected, new_name, value, size, position, XATTR_NOFOLLOW);
     } else {
-        res = getxattr(redirected.value, name, value, size, position, XATTR_NOFOLLOW);
+        res = getxattr(redirected, name, value, size, position, XATTR_NOFOLLOW);
     }
 
     if (res == -1) {
@@ -2353,30 +2734,89 @@ static int
 loopback_listxattr(const char *path, char *list, size_t size)
 {
     struct fuse_context *context = fuse_get_context();
-    struct path redirected = apply_wrapper_redirect_with_context(path, "LISTXATTR", context);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "LISTXATTR")) {
+        return -ENOTSUP;
     }
 
-    ssize_t res = listxattr(redirected.value, list, size, XATTR_NOFOLLOW);
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** LISTXATTR OVERLAY: %s ***\n", path);
+
+        // Find the file location in overlay
+        char upper_path[PATH_MAX], lower_path[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path, lower_path);
+
+        const char *target_path;
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                fprintf(stderr, "    -> File is whiteout (deleted)\n");
+                return -ENOENT;
+
+            case OVERLAY_UPPER:
+                fprintf(stderr, "    -> Listing xattr from UPPER: %s\n", upper_path);
+                target_path = upper_path;
+                break;
+
+            case OVERLAY_LOWER:
+                fprintf(stderr, "    -> Listing xattr from LOWER: %s\n", lower_path);
+                target_path = lower_path;
+                break;
+
+            case OVERLAY_NONE:
+                fprintf(stderr, "    -> File not found\n");
+                return -ENOENT;
+        }
+
+        ssize_t res = listxattr(target_path, list, size, XATTR_NOFOLLOW);
+        if (res > 0) {
+            if (list) {
+                size_t len = 0;
+                char *curr = list;
+                do {
+                    size_t thislen = strlen(curr) + 1;
+                    if (strncmp(curr, "org.apple.", 10) == 0) {
+                        curr[0] = 'c';
+                        curr[1] = 'o';
+                        curr[2] = 'm';
+                    }
+                    curr += thislen;
+                    len += thislen;
+                } while (len < res);
+            }
+        }
+
+        if (res == -1) {
+            return -errno;
+        }
+
+        return res;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
+
+    ssize_t res = listxattr(redirected, list, size, XATTR_NOFOLLOW);
     if (res > 0) {
         if (list) {
             size_t len = 0;
             char *curr = list;
             do {
                 size_t thislen = strlen(curr) + 1;
-                if (strncmp(curr, "com.apple.", 10) == 0) {
-                    curr[0] = 'o';
-                    curr[1] = 'r';
-                    curr[2] = 'g';
+                if (strncmp(curr, "org.apple.", 10) == 0) {
+                    curr[0] = 'c';
+                    curr[1] = 'o';
+                    curr[2] = 'm';
                 }
                 curr += thislen;
                 len += thislen;
             } while (len < res);
         } else {
             /*
-            ssize_t res2 = getxattr(redirected.value, G_KAUTH_FILESEC_XATTR, NULL, 0, 0,
+            ssize_t res2 = getxattr(redirected, G_KAUTH_FILESEC_XATTR, NULL, 0, 0,
                                     XATTR_NOFOLLOW);
             if (res2 >= 0) {
                 res -= sizeof(G_KAUTH_FILESEC_XATTR);
@@ -2397,19 +2837,75 @@ loopback_removexattr(const char *path, const char *name)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected = apply_wrapper_redirect_with_context(path, "REMOVEXATTR", context);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "REMOVEXATTR")) {
+        return -ENOTSUP;
     }
+
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** REMOVEXATTR OVERLAY: %s (name=%s) ***\n", path, name);
+
+        // Find the file location in overlay
+        char upper_path_buf[PATH_MAX], lower_path_buf[PATH_MAX];
+        overlay_location_t location = find_overlay_file_location(path, &overlay, upper_path_buf, lower_path_buf);
+
+        const char *target_path;
+        switch (location) {
+            case OVERLAY_WHITEOUT:
+                fprintf(stderr, "    -> File is whiteout (deleted)\n");
+                return -ENOENT;
+
+            case OVERLAY_NONE:
+                fprintf(stderr, "    -> File does not exist\n");
+                return -ENOENT;
+
+            case OVERLAY_LOWER:
+                // File is in lower layer - copy it up first (OverlayFS semantics)
+                fprintf(stderr, "    -> File in LOWER, copying to UPPER before removexattr\n");
+                res = copy_file_to_upper(lower_path_buf, upper_path_buf);
+                if (res < 0) {
+                    fprintf(stderr, "    -> Failed to copy file to upper: %d\n", res);
+                    return res;
+                }
+                target_path = upper_path_buf;
+                break;
+
+            case OVERLAY_UPPER:
+                // File already in upper layer
+                fprintf(stderr, "    -> Removing xattr from UPPER: %s\n", upper_path_buf);
+                target_path = upper_path_buf;
+                break;
+        }
+
+        if (strncmp(name, "com.apple.", 10) == 0) {
+            char new_name[MAXPATHLEN] = "org.apple.";
+            strncpy(new_name + 10, name + 10, sizeof(new_name) - 10);
+            res = removexattr(target_path, new_name, XATTR_NOFOLLOW);
+        } else {
+            res = removexattr(target_path, name, XATTR_NOFOLLOW);
+        }
+
+        if (res == -1) {
+            return -errno;
+        }
+
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
 
     if (strncmp(name, "com.apple.", 10) == 0) {
         char new_name[MAXPATHLEN] = "org.apple.";
         strncpy(new_name + 10, name + 10, sizeof(new_name) - 10);
 
-        res = removexattr(redirected.value, new_name, XATTR_NOFOLLOW);
+        res = removexattr(redirected, new_name, XATTR_NOFOLLOW);
     } else {
-        res = removexattr(redirected.value, name, XATTR_NOFOLLOW);
+        res = removexattr(redirected, name, XATTR_NOFOLLOW);
     }
 
     if (res == -1) {
@@ -2424,6 +2920,12 @@ loopback_fallocate(const char *path, int mode, off_t offset, off_t length,
                    struct fuse_file_info *fi)
 {
     fstore_t fstore;
+    struct fuse_context *context = fuse_get_context();
+
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "FALLOCATE")) {
+        return -ENOTSUP;
+    }
 
     if (!(mode & PREALLOCATE)) {
         return -ENOTSUP;
@@ -2464,13 +2966,39 @@ loopback_statfs_x(const char *path, struct statfs *stbuf)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected = apply_wrapper_redirect_with_context(path, "STATFS", context);
 
-    if (redirected.fail) {
-        return -redirected.error_code;
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "STATFS")) {
+        return -ENOTSUP;
     }
 
-    res = statfs(redirected.value, stbuf);
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** STATFS OVERLAY: %s ***\n", path);
+
+        // For overlay filesystem, report statistics from upper layer
+        // (where writes go - this is the limiting factor for space)
+        fprintf(stderr, "    -> Getting filesystem stats from UPPER: %s\n", overlay.upper_dir);
+
+        res = statfs(overlay.upper_dir, stbuf);
+        if (res == -1) {
+            return -errno;
+        }
+
+        stbuf->f_blocks = stbuf->f_blocks * stbuf->f_bsize / loopback.blocksize;
+        stbuf->f_bavail = stbuf->f_bavail * stbuf->f_bsize / loopback.blocksize;
+        stbuf->f_bfree = stbuf->f_bfree * stbuf->f_bsize / loopback.blocksize;
+        stbuf->f_bsize = loopback.blocksize;
+
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected[PATH_MAX];
+    get_passthrough_path(path, redirected);
+
+    res = statfs(redirected, stbuf);
     if (res == -1) {
         return -errno;
     }
@@ -2490,14 +3018,99 @@ loopback_renamex(const char *path1, const char *path2, unsigned int flags)
 {
     int res;
     struct fuse_context *context = fuse_get_context();
-    struct path redirected_path1 = apply_wrapper_redirect_with_context(path1, "RENAMEX1", context);
-    struct path redirected_path2 = apply_wrapper_redirect_with_context(path2, "RENAMEX2", context);
 
-    if (redirected_path1.fail || redirected_path2.fail) {
+    // Check if we should block fseventsd
+    if (should_block_fseventsd(context, "RENAMEX")) {
         return -ENOTSUP;
     }
 
-    res = renamex_np(redirected_path1.value, redirected_path2.value, flags);
+    // Check if this is an overlay filesystem operation
+    struct overlay_info overlay = find_overlay_in_tree(context->pid);
+    if (overlay.found) {
+        fprintf(stderr, "*** RENAMEX OVERLAY: %s -> %s (flags=0x%x) ***\n", path1, path2, flags);
+
+        // Find locations of source and destination
+        char path1_upper[PATH_MAX], path1_lower[PATH_MAX];
+        char path2_upper[PATH_MAX], path2_lower[PATH_MAX];
+        overlay_location_t loc1 = find_overlay_file_location(path1, &overlay, path1_upper, path1_lower);
+        overlay_location_t loc2 = find_overlay_file_location(path2, &overlay, path2_upper, path2_lower);
+
+        // Check if source exists
+        if (loc1 == OVERLAY_WHITEOUT || loc1 == OVERLAY_NONE) {
+            fprintf(stderr, "    -> Source file does not exist\n");
+            return -ENOENT;
+        }
+
+        // Handle RENAME_SWAP flag (similar to exchange)
+        if (flags & RENAME_SWAP) {
+            fprintf(stderr, "    -> RENAME_SWAP requested\n");
+
+            // Check if both files exist
+            if (loc2 == OVERLAY_WHITEOUT || loc2 == OVERLAY_NONE) {
+                fprintf(stderr, "    -> Destination does not exist (required for SWAP)\n");
+                return -ENOENT;
+            }
+
+            // Copy up both files if needed
+            if (loc1 == OVERLAY_LOWER) {
+                fprintf(stderr, "    -> Copying up path1 from LOWER to UPPER\n");
+                create_parent_directories(path1_upper);
+                if (copy_file_to_upper(path1_lower, path1_upper) != 0) {
+                    return -EIO;
+                }
+            }
+            if (loc2 == OVERLAY_LOWER) {
+                fprintf(stderr, "    -> Copying up path2 from LOWER to UPPER\n");
+                create_parent_directories(path2_upper);
+                if (copy_file_to_upper(path2_lower, path2_upper) != 0) {
+                    return -EIO;
+                }
+            }
+
+            // Perform swap in upper layer
+            res = renamex_np(path1_upper, path2_upper, flags);
+            if (res == -1) {
+                fprintf(stderr, "    -> Swap failed: %s\n", strerror(errno));
+                return -errno;
+            }
+
+            return 0;
+        }
+
+        // Handle normal rename (possibly with RENAME_EXCL flag)
+        if (loc1 == OVERLAY_LOWER) {
+            fprintf(stderr, "    -> Source is in LOWER, copying to UPPER at new location\n");
+            create_parent_directories(path2_upper);
+            if (copy_file_to_upper(path1_lower, path2_upper) != 0) {
+                return -EIO;
+            }
+
+            // Create whiteout marker at old location
+            create_whiteout_marker(path1, &overlay);
+        } else {
+            // Source is in upper - perform normal rename
+            fprintf(stderr, "    -> Source is in UPPER, renaming\n");
+            create_parent_directories(path2_upper);
+            res = renamex_np(path1_upper, path2_upper, flags);
+            if (res == -1) {
+                fprintf(stderr, "    -> Rename failed: %s\n", strerror(errno));
+                return -errno;
+            }
+        }
+
+        // Remove any whiteout marker at destination
+        remove_whiteout_marker(overlay.upper_dir, path2);
+
+        return 0;
+    }
+
+    // Non-overlay path: use passthrough
+    char redirected_path1[PATH_MAX];
+    char redirected_path2[PATH_MAX];
+    get_passthrough_path(path1, redirected_path1);
+    get_passthrough_path(path2, redirected_path2);
+
+    res = renamex_np(redirected_path1, redirected_path2, flags);
     if (res == -1) {
         return -errno;
     }
