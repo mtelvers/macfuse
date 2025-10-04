@@ -347,6 +347,9 @@ static void create_parent_directories(const char* file_path) {
     strncpy(tmp, file_path, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
 
+    // Get calling process context for ownership
+    struct fuse_context *context = fuse_get_context();
+
     char *last_slash = strrchr(tmp, '/');
     if (last_slash && last_slash != tmp) {
         *last_slash = '\0';
@@ -355,11 +358,17 @@ static void create_parent_directories(const char* file_path) {
         for (char *p = tmp + 1; *p; p++) {
             if (*p == '/') {
                 *p = '\0';
-                mkdir(tmp, 0755);
+                if (mkdir(tmp, 0755) == 0 && context) {
+                    // Set ownership to calling process
+                    chown(tmp, context->uid, context->gid);
+                }
                 *p = '/';
             }
         }
-        mkdir(tmp, 0755);
+        if (mkdir(tmp, 0755) == 0 && context) {
+            // Set ownership to calling process
+            chown(tmp, context->uid, context->gid);
+        }
     }
 }
 
@@ -743,20 +752,29 @@ loopback_readlink(const char *path, char *buf, size_t size)
     return 0;
 }
 
+// Passthrough directory structure (non-overlay mode)
 struct loopback_dirp {
+    bool is_overlay;     // Always false for passthrough mode
     DIR *dp;
     struct dirent *entry;
     off_t offset;
 };
 
-// Overlay directory structure for merged directory listing
+// Overlay directory structure (overlay mode)
 struct overlay_dirp {
-    bool is_overlay;                    // True if this is an overlay directory
-    char **merged_entries;              // Array of merged filenames
+    bool is_overlay;                    // Always true for overlay mode
+    char **merged_entries;              // Array of directory entry names (always used)
     int entry_count;                    // Number of entries
     int current_index;                  // Current position for iteration
     struct overlay_info overlay_info;   // Store overlay info for this directory
     char original_path[PATH_MAX];       // Original requested path
+};
+
+// Union for type-safe directory handle discrimination
+// Both structs have is_overlay as first field, so we can check either one
+union fuse_dirp {
+    struct loopback_dirp loopback;
+    struct overlay_dirp overlay;
 };
 
 // Function to merge directory entries from upper and lower layers
@@ -788,13 +806,22 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     *entry_count = 0;
 
     // Track which files we've seen to avoid duplicates (upper takes precedence)
-    char seen_files[1000][256];  // Simple fixed-size array for tracking
+    char **seen_files = malloc(1000 * sizeof(char*));
+    if (!seen_files) {
+        free(*entries);
+        return -ENOMEM;
+    }
     int seen_count = 0;
 
     // Read whiteout directory to get list of deleted files
     // Important: only regular files in .deleted are whiteout markers
     // Directories in .deleted are just structure to hold nested whiteout markers
-    char whiteout_files[1000][256];
+    char **whiteout_files = malloc(1000 * sizeof(char*));
+    if (!whiteout_files) {
+        free(seen_files);
+        free(*entries);
+        return -ENOMEM;
+    }
     int whiteout_count = 0;
     DIR* whiteout_dp = opendir(whiteout_path);
     if (whiteout_dp) {
@@ -808,8 +835,7 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
                 struct stat whiteout_st;
                 if (lstat(full_whiteout_path, &whiteout_st) == 0 && S_ISREG(whiteout_st.st_mode)) {
                     // Only add regular files as whiteout markers
-                    strncpy(whiteout_files[whiteout_count], entry->d_name, sizeof(whiteout_files[0]) - 1);
-                    whiteout_files[whiteout_count][sizeof(whiteout_files[0]) - 1] = '\0';
+                    whiteout_files[whiteout_count] = strdup(entry->d_name);
                     whiteout_count++;
                 }
             }
@@ -830,8 +856,7 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
                 }
 
                 (*entries)[*entry_count] = strdup(entry->d_name);
-                strncpy(seen_files[seen_count], entry->d_name, sizeof(seen_files[0]) - 1);
-                seen_files[seen_count][sizeof(seen_files[0]) - 1] = '\0';
+                seen_files[seen_count] = strdup(entry->d_name);
                 seen_count++;
                 (*entry_count)++;
                 fprintf(stderr, "        Added from upper: %s\n", entry->d_name);
@@ -875,6 +900,18 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     }
 
     fprintf(stderr, "      Total merged entries: %d\n", *entry_count);
+
+    // Free temporary tracking arrays
+    for (int i = 0; i < seen_count; i++) {
+        free(seen_files[i]);
+    }
+    free(seen_files);
+
+    for (int i = 0; i < whiteout_count; i++) {
+        free(whiteout_files[i]);
+    }
+    free(whiteout_files);
+
     return 0;
 }
 
@@ -1006,69 +1043,97 @@ loopback_opendir(const char *path, struct fuse_file_info *fi)
     // Check for overlay configuration
     struct overlay_info overlay = find_overlay_in_tree(context->pid);
     if (overlay.found && strlen(overlay.upper_dir) > 0) {
-        // This is an overlay directory - use merged directory listing
-        struct overlay_dirp *od = malloc(sizeof(struct overlay_dirp));
-        if (od == NULL) {
+        // Allocate union for overlay mode
+        union fuse_dirp *dirp = malloc(sizeof(union fuse_dirp));
+        if (dirp == NULL) {
             return -ENOMEM;
         }
 
-        od->is_overlay = true;
-        od->overlay_info = overlay;
-        od->current_index = 0;
-        strncpy(od->original_path, path, sizeof(od->original_path) - 1);
-        od->original_path[sizeof(od->original_path) - 1] = '\0';
+        // Initialize overlay_dirp fields
+        dirp->overlay.is_overlay = true;
+        dirp->overlay.overlay_info = overlay;
+        dirp->overlay.current_index = 0;
+        dirp->overlay.merged_entries = NULL;
+        dirp->overlay.entry_count = 0;
+        strncpy(dirp->overlay.original_path, path, sizeof(dirp->overlay.original_path) - 1);
+        dirp->overlay.original_path[sizeof(dirp->overlay.original_path) - 1] = '\0';
 
-        // Merge directory entries from upper and lower layers
-        res = merge_overlay_directory_entries(path, &overlay, &od->merged_entries, &od->entry_count);
+        // Check if directory exists in upper, lower, or has whiteout marker
+        char upper_path[PATH_MAX], lower_path[PATH_MAX];
+        concatenate_path(path, overlay.upper_dir, upper_path);
+        concatenate_path(path, overlay.lower_dir, lower_path);
+
+        // Check for whiteout marker first
+        char whiteout_path[PATH_MAX];
+        if (strcmp(path, "/") == 0) {
+            snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted", overlay.upper_dir);
+        } else {
+            snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted%s", overlay.upper_dir, path);
+        }
+
+        struct stat whiteout_st;
+        if (lstat(whiteout_path, &whiteout_st) == 0 && S_ISREG(whiteout_st.st_mode)) {
+            // Whiteout marker exists - directory is deleted
+            free(dirp);
+            return -ENOENT;
+        }
+
+        struct stat upper_st, lower_st;
+        bool exists_upper = (lstat(upper_path, &upper_st) == 0 && S_ISDIR(upper_st.st_mode));
+        bool exists_lower = (lstat(lower_path, &lower_st) == 0 && S_ISDIR(lower_st.st_mode));
+
+        if (!exists_upper && !exists_lower) {
+            // Directory doesn't exist in either layer
+            free(dirp);
+            return -ENOENT;
+        }
+
+        // Always build merged_entries array (handles both single-layer and merged cases)
+        res = merge_overlay_directory_entries(path, &overlay, &dirp->overlay.merged_entries, &dirp->overlay.entry_count);
         if (res < 0) {
-            free(od);
+            free(dirp);
             return res;
         }
 
-        fi->fh = (unsigned long)od;
+        fi->fh = (unsigned long)dirp;
         return 0;
     }
 
-    // Fall back to regular directory handling
+    // Fall back to regular passthrough directory handling
     char redirected[PATH_MAX];
     get_passthrough_path(path, redirected);
 
-    struct loopback_dirp *d = malloc(sizeof(struct loopback_dirp));
-    if (d == NULL) {
+    union fuse_dirp *dirp = malloc(sizeof(union fuse_dirp));
+    if (dirp == NULL) {
         return -ENOMEM;
     }
 
-    d->dp = opendir(redirected);
-    if (d->dp == NULL) {
+    dirp->loopback.is_overlay = false;
+    dirp->loopback.dp = opendir(redirected);
+    if (dirp->loopback.dp == NULL) {
         res = -errno;
-        free(d);
+        free(dirp);
         return res;
     }
 
-    d->offset = 0;
-    d->entry = NULL;
+    dirp->loopback.offset = 0;
+    dirp->loopback.entry = NULL;
 
-    fi->fh = (unsigned long)d;
+    fi->fh = (unsigned long)dirp;
 
     return 0;
-}
-
-static inline struct loopback_dirp *
-get_dirp(struct fuse_file_info *fi)
-{
-    return (struct loopback_dirp *)(uintptr_t)fi->fh;
 }
 
 static int
 loopback_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                  off_t offset, struct fuse_file_info *fi)
 {
-    // Check if this is an overlay directory by examining the first field
-    // overlay_dirp starts with is_overlay = true (1), loopback_dirp starts with DIR* pointer
-    struct overlay_dirp *od = (struct overlay_dirp *)(uintptr_t)fi->fh;
+    union fuse_dirp *dirp = (union fuse_dirp *)(uintptr_t)fi->fh;
 
-    // Simple heuristic: if first byte is 1, it's likely an overlay_dirp
-    if (od && od->is_overlay) {
+    if (dirp->loopback.is_overlay) {
+        // Overlay directory - use cached entry list (always)
+        struct overlay_dirp *od = &dirp->overlay;
+
         // If offset is 0, rebuild the directory entries (like rewinddir for regular dirs)
         if (offset == 0) {
             // Free old entries
@@ -1123,10 +1188,16 @@ loopback_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
                 snprintf(full_path, sizeof(full_path), "%s/%s", od->original_path, od->merged_entries[i]);
             }
 
-            // Use our overlay logic to find the file and get its stats
-            char redirected[PATH_MAX];
-            get_passthrough_path(full_path, redirected);
-            lstat(redirected, &st);
+            // Use overlay logic to find the file in upper/lower layers and get its stats
+            char upper_path[PATH_MAX], lower_path[PATH_MAX];
+            overlay_location_t location = find_overlay_file_location(full_path, &od->overlay_info, upper_path, lower_path);
+
+            if (location == OVERLAY_UPPER) {
+                lstat(upper_path, &st);
+            } else if (location == OVERLAY_LOWER) {
+                lstat(lower_path, &st);
+            }
+            // If not found or whiteout, keep default st.st_mode = S_IFREG
 
             off_t nextoff = i + 3;  // +3 for ., .., and 0-based index
             if (filler(buf, od->merged_entries[i], &st, nextoff)) {
@@ -1136,8 +1207,8 @@ loopback_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 
         return 0;
     } else {
-        // Handle regular directory - use existing logic
-        struct loopback_dirp *d = get_dirp(fi);
+        // Passthrough directory - use regular DIR* pointer
+        struct loopback_dirp *d = &dirp->loopback;
 
         (void)path;
 
@@ -1189,13 +1260,13 @@ loopback_readdir(const char *path, void *buf, fuse_fill_dir_t filler,
 static int
 loopback_releasedir(const char *path, struct fuse_file_info *fi)
 {
-    // Check if this is an overlay directory
-    struct overlay_dirp *od = (struct overlay_dirp *)(uintptr_t)fi->fh;
+    union fuse_dirp *dirp = (union fuse_dirp *)(uintptr_t)fi->fh;
 
     (void)path;
 
-    if (od && od->is_overlay) {
+    if (dirp->loopback.is_overlay) {
         // Handle overlay directory cleanup
+        struct overlay_dirp *od = &dirp->overlay;
         fprintf(stderr, "    Releasing overlay directory: %s (%d entries)\n",
                 od->original_path, od->entry_count);
 
@@ -1203,17 +1274,15 @@ loopback_releasedir(const char *path, struct fuse_file_info *fi)
         for (int i = 0; i < od->entry_count; i++) {
             free(od->merged_entries[i]);
         }
-
         // Free the entries array
         free(od->merged_entries);
 
-        // Free the overlay directory structure
-        free(od);
+        free(dirp);
     } else {
-        // Handle regular directory cleanup
-        struct loopback_dirp *d = get_dirp(fi);
+        // Handle passthrough directory cleanup
+        struct loopback_dirp *d = &dirp->loopback;
         closedir(d->dp);
-        free(d);
+        free(dirp);
     }
 
     return 0;
