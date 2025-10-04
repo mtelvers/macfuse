@@ -42,11 +42,6 @@
 #include <libproc.h>
 #include <sys/sysctl.h>
 
-struct path {
-    bool fail;
-    char value[PATH_MAX];
-};
-
 // File location enumeration for overlay filesystem
 typedef enum {
     OVERLAY_UPPER,      // File exists in upper layer
@@ -199,8 +194,9 @@ static pid_t get_parent_pid(pid_t pid) {
 }
 
 // Function to get specific environment variable value from process
-static struct path get_env_from_process(pid_t pid, const char* env_name) {
-    struct path result = { .fail = true };
+// Returns true if env variable found, false otherwise
+// value_out must be at least value_size bytes
+static bool get_env_from_process(pid_t pid, const char* env_name, char* value_out, size_t value_size) {
 
     // Get the full process args and environment data
     int mib[3] = { CTL_KERN, KERN_PROCARGS2, pid };
@@ -208,32 +204,32 @@ static struct path get_env_from_process(pid_t pid, const char* env_name) {
 
     if (sysctl(mib, 3, NULL, &size, NULL, 0) != 0) {
         fprintf(stderr, "    sysctl size query failed for PID %d (errno=%d)\n", pid, errno);
-        return result;
+        return false;
     }
 
     // Sanity check the size
     if (size < sizeof(int) || size > 1024 * 1024) { // Max 1MB seems reasonable
         fprintf(stderr, "    suspicious size %zu for PID %d, aborting\n", size, pid);
-        return result;
+        return false;
     }
 
     char *proc_data = malloc(size);
     if (!proc_data) {
         fprintf(stderr, "    malloc failed for PID %d\n", pid);
-        return result;
+        return false;
     }
 
     if (sysctl(mib, 3, proc_data, &size, NULL, 0) != 0) {
         fprintf(stderr, "    sysctl data query failed for PID %d (errno=%d)\n", pid, errno);
         free(proc_data);
-        return result;
+        return false;
     }
 
     // Bounds checking - ensure we have at least space for argc
     if (size < sizeof(int)) {
         fprintf(stderr, "    insufficient data for PID %d (size=%zu)\n", pid, size);
         free(proc_data);
-        return result;
+        return false;
     }
 
     // Format: argc, then executable path, then args, then env
@@ -245,7 +241,7 @@ static struct path get_env_from_process(pid_t pid, const char* env_name) {
     if (argc < 0 || argc > 1000) { // Reasonable limit
         fprintf(stderr, "    suspicious argc %d for PID %d, aborting\n", argc, pid);
         free(proc_data);
-        return result;
+        return false;
     }
 
     fprintf(stderr, "    PID %d has %d args, checking environment...\n", pid, argc);
@@ -254,14 +250,14 @@ static struct path get_env_from_process(pid_t pid, const char* env_name) {
     if (ptr >= data_end) {
         fprintf(stderr, "    no space for executable path in PID %d\n", pid);
         free(proc_data);
-        return result;
+        return false;
     }
 
     size_t exec_len = strnlen(ptr, data_end - ptr);
     if (exec_len == (size_t)(data_end - ptr)) {
         fprintf(stderr, "    unterminated executable path in PID %d\n", pid);
         free(proc_data);
-        return result;
+        return false;
     }
     ptr += exec_len + 1;
 
@@ -277,7 +273,7 @@ static struct path get_env_from_process(pid_t pid, const char* env_name) {
             if (arg_len == (size_t)(data_end - ptr)) {
                 fprintf(stderr, "    unterminated arg[%d] in PID %d\n", i, pid);
                 free(proc_data);
-                return result;
+                return false;
             }
             fprintf(stderr, "    arg[%d]: %.*s\n", i, (int)arg_len, ptr);
             ptr += arg_len + 1;
@@ -303,13 +299,12 @@ static struct path get_env_from_process(pid_t pid, const char* env_name) {
         if (env_len >= search_len && strncmp(ptr, env_name, env_name_len) == 0 && ptr[env_name_len] == '=') {
             // Found env_name= environment variable, extract the value
             size_t value_len = env_len - search_len;
-            if (value_len < sizeof(result.value)) {
-                strncpy(result.value, ptr + search_len, value_len);
-                result.value[value_len] = '\0';
-                result.fail = false;
-                fprintf(stderr, "    Found %s=%s (env var #%d)\n", env_name, result.value, env_count);
+            if (value_len < value_size) {
+                strncpy(value_out, ptr + search_len, value_len);
+                value_out[value_len] = '\0';
+                fprintf(stderr, "    Found %s=%s (env var #%d)\n", env_name, value_out, env_count);
                 free(proc_data);
-                return result;
+                return true;
             }
         }
         ptr += env_len + 1;
@@ -317,7 +312,7 @@ static struct path get_env_from_process(pid_t pid, const char* env_name) {
 
     fprintf(stderr, "    Checked %d environment variables, no %s found\n", env_count, env_name);
     free(proc_data);
-    return result;
+    return false;
 }
 
 // Function to concatenate paths
@@ -476,22 +471,19 @@ static struct overlay_info find_overlay_in_tree(pid_t starting_pid) {
 
     while (current_pid > 1 && depth < 10) {
         // Check if this process has WRAPPER_UPPER and WRAPPER_LOWER in its environment variables
-        struct path upper_env = get_env_from_process(current_pid, "WRAPPER_UPPER");
-        struct path lower_env = get_env_from_process(current_pid, "WRAPPER_LOWER");
+        // Write directly into result struct to avoid intermediate copies
+        bool has_upper = get_env_from_process(current_pid, "WRAPPER_UPPER", result.upper_dir, sizeof(result.upper_dir));
+        bool has_lower = get_env_from_process(current_pid, "WRAPPER_LOWER", result.lower_dir, sizeof(result.lower_dir));
 
         fprintf(stderr, "  PID %d: upper=%s, lower=%s\n",
                 current_pid,
-                !upper_env.fail ? "YES" : "no",
-                !lower_env.fail ? "YES" : "no");
+                has_upper ? "YES" : "no",
+                has_lower ? "YES" : "no");
 
-        if (!upper_env.fail && !lower_env.fail) {
+        if (has_upper && has_lower) {
             result.found = 1;
             result.pid = current_pid;
-            strncpy(result.upper_dir, upper_env.value, sizeof(result.upper_dir) - 1);
-            result.upper_dir[sizeof(result.upper_dir) - 1] = '\0';
-            strncpy(result.lower_dir, lower_env.value, sizeof(result.lower_dir) - 1);
-            result.lower_dir[sizeof(result.lower_dir) - 1] = '\0';
-            fprintf(stderr, "Found WRAPPER_UPPER=%s WRAPPER_LOWER=%s at PID %d!\n", upper_env.value, lower_env.value, current_pid);
+            fprintf(stderr, "Found WRAPPER_UPPER=%s WRAPPER_LOWER=%s at PID %d!\n", result.upper_dir, result.lower_dir, current_pid);
             return result;
         }
 
