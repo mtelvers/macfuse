@@ -777,6 +777,28 @@ union fuse_dirp {
     struct overlay_dirp overlay;
 };
 
+// Helper function to free an array of strings
+static void free_string_array(char** array, int count) {
+    if (!array) return;
+    for (int i = 0; i < count; i++) {
+        free(array[i]);
+    }
+    free(array);
+}
+
+// Helper function to grow a string array using realloc
+// Returns 0 on success, -ENOMEM on failure
+static int grow_string_array(char*** array, int* capacity) {
+    int new_capacity = (*capacity) * 2;
+    char** new_array = realloc(*array, new_capacity * sizeof(char*));
+    if (!new_array) {
+        return -ENOMEM;
+    }
+    *array = new_array;
+    *capacity = new_capacity;
+    return 0;
+}
+
 // Function to merge directory entries from upper and lower layers
 static int merge_overlay_directory_entries(const char* original_path, const struct overlay_info* overlay,
                                            char*** entries, int* entry_count) {
@@ -797,16 +819,17 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     fprintf(stderr, "      Lower dir: %s\n", lower_path_buf);
     fprintf(stderr, "      Whiteout dir: %s\n", whiteout_path);
 
-    // Simple implementation: allocate array for up to 1000 entries
-    *entries = malloc(1000 * sizeof(char*));
+    // Dynamic allocation with realloc - start with reasonable initial capacity
+    int entries_capacity = 256;
+    *entries = malloc(entries_capacity * sizeof(char*));
     if (!*entries) {
         return -ENOMEM;
     }
-
     *entry_count = 0;
 
     // Track which files we've seen to avoid duplicates (upper takes precedence)
-    char **seen_files = malloc(1000 * sizeof(char*));
+    int seen_capacity = 256;
+    char **seen_files = malloc(seen_capacity * sizeof(char*));
     if (!seen_files) {
         free(*entries);
         return -ENOMEM;
@@ -816,7 +839,8 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     // Read whiteout directory to get list of deleted files
     // Important: only regular files in .deleted are whiteout markers
     // Directories in .deleted are just structure to hold nested whiteout markers
-    char **whiteout_files = malloc(1000 * sizeof(char*));
+    int whiteout_capacity = 256;
+    char **whiteout_files = malloc(whiteout_capacity * sizeof(char*));
     if (!whiteout_files) {
         free(seen_files);
         free(*entries);
@@ -826,7 +850,7 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     DIR* whiteout_dp = opendir(whiteout_path);
     if (whiteout_dp) {
         struct dirent* entry;
-        while ((entry = readdir(whiteout_dp)) && whiteout_count < 1000) {
+        while ((entry = readdir(whiteout_dp))) {
             if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
                 // Check if this is a regular file (whiteout marker) or directory (structure)
                 char full_whiteout_path[PATH_MAX];
@@ -834,6 +858,17 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
 
                 struct stat whiteout_st;
                 if (lstat(full_whiteout_path, &whiteout_st) == 0 && S_ISREG(whiteout_st.st_mode)) {
+                    // Grow array if needed
+                    if (whiteout_count >= whiteout_capacity) {
+                        if (grow_string_array(&whiteout_files, &whiteout_capacity) != 0) {
+                            free_string_array(whiteout_files, whiteout_count);
+                            free_string_array(seen_files, seen_count);
+                            free(*entries);
+                            closedir(whiteout_dp);
+                            return -ENOMEM;
+                        }
+                    }
+
                     // Only add regular files as whiteout markers
                     whiteout_files[whiteout_count] = strdup(entry->d_name);
                     whiteout_count++;
@@ -848,11 +883,33 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     DIR* upper_dp = opendir(upper_path_buf);
     if (upper_dp) {
         struct dirent* entry;
-        while ((entry = readdir(upper_dp)) && *entry_count < 1000) {
+        while ((entry = readdir(upper_dp))) {
             if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
                 // Skip .deleted directory itself
                 if (strcmp(entry->d_name, ".deleted") == 0) {
                     continue;
+                }
+
+                // Grow entries array if needed
+                if (*entry_count >= entries_capacity) {
+                    if (grow_string_array(entries, &entries_capacity) != 0) {
+                        free_string_array(*entries, *entry_count);
+                        free_string_array(seen_files, seen_count);
+                        free_string_array(whiteout_files, whiteout_count);
+                        closedir(upper_dp);
+                        return -ENOMEM;
+                    }
+                }
+
+                // Grow seen_files array if needed
+                if (seen_count >= seen_capacity) {
+                    if (grow_string_array(&seen_files, &seen_capacity) != 0) {
+                        free_string_array(*entries, *entry_count);
+                        free_string_array(seen_files, seen_count);
+                        free_string_array(whiteout_files, whiteout_count);
+                        closedir(upper_dp);
+                        return -ENOMEM;
+                    }
                 }
 
                 (*entries)[*entry_count] = strdup(entry->d_name);
@@ -869,7 +926,7 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     DIR* lower_dp = opendir(lower_path_buf);
     if (lower_dp) {
         struct dirent* entry;
-        while ((entry = readdir(lower_dp)) && *entry_count < 1000) {
+        while ((entry = readdir(lower_dp))) {
             if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
                 // Check if already seen (upper takes precedence)
                 bool found_in_upper = false;
@@ -890,6 +947,17 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
                 }
 
                 if (!found_in_upper && !is_whiteout) {
+                    // Grow entries array if needed
+                    if (*entry_count >= entries_capacity) {
+                        if (grow_string_array(entries, &entries_capacity) != 0) {
+                            free_string_array(*entries, *entry_count);
+                            free_string_array(seen_files, seen_count);
+                            free_string_array(whiteout_files, whiteout_count);
+                            closedir(lower_dp);
+                            return -ENOMEM;
+                        }
+                    }
+
                     (*entries)[*entry_count] = strdup(entry->d_name);
                     (*entry_count)++;
                     fprintf(stderr, "        Added from lower: %s\n", entry->d_name);
@@ -902,15 +970,8 @@ static int merge_overlay_directory_entries(const char* original_path, const stru
     fprintf(stderr, "      Total merged entries: %d\n", *entry_count);
 
     // Free temporary tracking arrays
-    for (int i = 0; i < seen_count; i++) {
-        free(seen_files[i]);
-    }
-    free(seen_files);
-
-    for (int i = 0; i < whiteout_count; i++) {
-        free(whiteout_files[i]);
-    }
-    free(whiteout_files);
+    free_string_array(seen_files, seen_count);
+    free_string_array(whiteout_files, whiteout_count);
 
     return 0;
 }
