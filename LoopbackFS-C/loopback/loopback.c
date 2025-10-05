@@ -1020,6 +1020,85 @@ static int remove_directory_recursive(const char* path) {
     return failed ? -1 : 0;
 }
 
+// Helper function to check if a directory is empty in overlay view
+// Returns: 1 if empty, 0 if not empty, -errno on error
+static int is_overlay_directory_empty(const char* path, const struct overlay_info* overlay) {
+    char upper_path[PATH_MAX], lower_path[PATH_MAX];
+    concatenate_path(path, overlay->upper_dir, upper_path);
+    concatenate_path(path, overlay->lower_dir, lower_path);
+
+    // Check upper directory for non-whiteout entries
+    DIR *upper_dir = opendir(upper_path);
+    if (upper_dir) {
+        struct dirent *entry;
+        while ((entry = readdir(upper_dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+            if (strcmp(entry->d_name, ".deleted") == 0) {
+                continue;  // Skip whiteout directory itself
+            }
+            // Found a real entry in upper - directory is not empty
+            closedir(upper_dir);
+            return 0;
+        }
+        closedir(upper_dir);
+    }
+
+    // Check lower directory - all entries must have whiteout markers
+    DIR *lower_dir = opendir(lower_path);
+    if (lower_dir) {
+        struct dirent *entry;
+        while ((entry = readdir(lower_dir)) != NULL) {
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) {
+                continue;
+            }
+
+            // Check if this entry has a whiteout marker
+            char whiteout_path[PATH_MAX];
+            char entry_path[PATH_MAX];
+            snprintf(entry_path, sizeof(entry_path), "%s/%s", path, entry->d_name);
+
+            char *dir_part, *file_part;
+            char path_copy[PATH_MAX];
+            strncpy(path_copy, entry_path, sizeof(path_copy) - 1);
+            path_copy[sizeof(path_copy) - 1] = '\0';
+
+            file_part = strrchr(path_copy, '/');
+            if (!file_part) {
+                closedir(lower_dir);
+                return -EINVAL;
+            }
+            *file_part = '\0';
+            file_part++;
+            dir_part = path_copy;
+
+            if (strlen(dir_part) == 0) {
+                dir_part = "/";
+            }
+
+            if (strcmp(dir_part, "/") == 0) {
+                snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted/%s",
+                        overlay->upper_dir, file_part);
+            } else {
+                snprintf(whiteout_path, sizeof(whiteout_path), "%s/.deleted%s/%s",
+                        overlay->upper_dir, dir_part, file_part);
+            }
+
+            struct stat whiteout_st;
+            if (lstat(whiteout_path, &whiteout_st) != 0) {
+                // No whiteout marker - this entry is still visible
+                closedir(lower_dir);
+                return 0;
+            }
+        }
+        closedir(lower_dir);
+    }
+
+    // Directory is empty in overlay view
+    return 1;
+}
+
 // Helper function to create whiteout marker for overlay deletes
 static int create_whiteout_marker(const char* original_path, const struct overlay_info* overlay) {
     char whiteout_dir[PATH_MAX];
@@ -1081,9 +1160,20 @@ static int create_whiteout_marker(const char* original_path, const struct overla
     // If a file already exists here, creat() will truncate it (which is fine - same effect)
     int fd = creat(whiteout_file, 0644);
     if (fd < 0) {
+        DEBUG_LOG( "    ERROR: creat() failed for %s: errno=%d (%s)\n", whiteout_file, errno, strerror(errno));
         return -errno;
     }
     close(fd);
+
+    // Verify the file was created
+    struct stat verify_st;
+    if (lstat(whiteout_file, &verify_st) == 0) {
+        DEBUG_LOG( "    SUCCESS: Whiteout marker verified at %s (size=%lld, mode=%o)\n",
+                  whiteout_file, (long long)verify_st.st_size, verify_st.st_mode);
+    } else {
+        DEBUG_LOG( "    WARNING: Whiteout marker creation succeeded but stat failed: %s (errno=%d: %s)\n",
+                  whiteout_file, errno, strerror(errno));
+    }
 
     return 0;
 }
@@ -1587,8 +1677,17 @@ loopback_rmdir(const char *path)
                     // Check if directory also exists in lower layer
                     struct stat lower_st;
                     if (lstat(lower_path, &lower_st) == 0 && S_ISDIR(lower_st.st_mode)) {
-                        // Directory exists in lower - create whiteout marker to hide it
-                        DEBUG_LOG( "    -> Directory also in lower, creating whiteout marker\n");
+                        // Directory exists in lower - check if it's empty before creating whiteout
+                        DEBUG_LOG( "    -> Directory also in lower, checking if empty\n");
+                        int is_empty = is_overlay_directory_empty(path, &overlay);
+                        if (is_empty < 0) {
+                            return is_empty;  // Error
+                        }
+                        if (!is_empty) {
+                            DEBUG_LOG( "    -> ERROR: Directory not empty, cannot rmdir\n");
+                            return -ENOTEMPTY;
+                        }
+                        DEBUG_LOG( "    -> Directory is empty, creating whiteout marker\n");
                         res = create_whiteout_marker(path, &overlay);
                         if (res < 0) {
                             return res;
@@ -1598,8 +1697,17 @@ loopback_rmdir(const char *path)
                 }
 
             case OVERLAY_LOWER:
-                // Directory exists only in lower layer - create whiteout marker
-                DEBUG_LOG( "*** RMDIR OVERLAY LOWER: %s -> create whiteout ***\n", path);
+                // Directory exists only in lower layer - check if empty before creating whiteout
+                DEBUG_LOG( "*** RMDIR OVERLAY LOWER: %s -> check if empty ***\n", path);
+                int is_empty = is_overlay_directory_empty(path, &overlay);
+                if (is_empty < 0) {
+                    return is_empty;  // Error
+                }
+                if (!is_empty) {
+                    DEBUG_LOG( "    -> ERROR: Directory not empty, cannot rmdir\n");
+                    return -ENOTEMPTY;
+                }
+                DEBUG_LOG( "    -> Directory is empty, creating whiteout marker\n");
                 res = create_whiteout_marker(path, &overlay);
                 if (res < 0) {
                     return res;
